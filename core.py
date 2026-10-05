@@ -8,6 +8,7 @@ from db import (
     get_active_requests,
     get_completed_requests,
     get_photo_counts,
+    get_dashboard_counts,
     STATUS_LABELS,
 )
 
@@ -74,7 +75,10 @@ def format_task_html(task: dict, today: date, photo_count: int = 0) -> str:
     task_id = task.get("id", "?")
 
     req_date_str = task.get("request_date", "")
-    req_date = date.fromisoformat(req_date_str) if req_date_str else None
+    try:
+        req_date = date.fromisoformat(req_date_str) if req_date_str else None
+    except (ValueError, TypeError):
+        req_date = None
 
     days_elapsed = (today - req_date).days if req_date else 0
     is_overdue = days_elapsed > OVERDUE_DAYS
@@ -156,7 +160,10 @@ def _build_completed_report(today: date, save_to_file: bool) -> tuple:
         obj = escape(task.get("object", "—"))
         initiator = escape(task.get("initiator", "—"))
         done_str = task.get("done_date", "")
-        done_date = date.fromisoformat(done_str) if done_str else None
+        try:
+            done_date = date.fromisoformat(done_str) if done_str else None
+        except (ValueError, TypeError):
+            done_date = None
         done_text = done_date.strftime("%d.%m.%Y") if done_date else "—"
         qty_text = f"{qty} {unit}".strip() if qty else "—"
         notes_raw = task.get("notes") or ""
@@ -210,13 +217,20 @@ def _build_active_report(today: date, save_to_file: bool) -> tuple:
         st = t.get("status", "new")
         by_status[st] = by_status.get(st, 0) + 1
 
-    overdue = [
-        t
-        for t in active_tasks
-        if t.get("request_date")
-        and date.fromisoformat(t["request_date"]) < today - timedelta(days=OVERDUE_DAYS)
-        and t.get("status") not in ("done", "delivered")
-    ]
+    overdue = []
+    for t in active_tasks:
+        req_date_str = t.get("request_date")
+        if not req_date_str:
+            continue
+        try:
+            req_date = date.fromisoformat(req_date_str)
+        except (ValueError, TypeError):
+            continue
+        if req_date < today - timedelta(days=OVERDUE_DAYS) and t.get("status") not in (
+            "done",
+            "delivered",
+        ):
+            overdue.append(t)
 
     for st_key, st_label in STATUS_LABELS.items():
         if st_key in by_status and st_key != "done":
@@ -263,7 +277,12 @@ def _build_active_report(today: date, save_to_file: bool) -> tuple:
                 obj = escape(task.get("object", "—"))
                 notes_raw = task.get("notes") or ""
                 req_date_str = task.get("request_date", "")
-                req_date = date.fromisoformat(req_date_str) if req_date_str else None
+                try:
+                    req_date = (
+                        date.fromisoformat(req_date_str) if req_date_str else None
+                    )
+                except (ValueError, TypeError):
+                    req_date = None
                 days = (today - req_date).days if req_date else 0
                 pc = photo_counts.get(task["id"], 0)
                 photo_label = f" 📎{pc}" if pc else ""
@@ -280,6 +299,24 @@ def _build_active_report(today: date, save_to_file: bool) -> tuple:
         _save_report(result)
     logger.info("Отчёт сформирован")
     return result, ids_with_photos, all_ids
+
+
+def build_dashboard() -> str:
+    """Генерирует HTML-дашборд с ключевыми метриками."""
+    today = date.today()
+    counts = get_dashboard_counts()
+
+    lines = [
+        f"📊 <b>Сводка на {today.strftime('%d.%m.%Y')}</b>",
+        "",
+        f"⚪ Новых: <b>{counts.get('new', 0)}</b>",
+        f"🟡 Заказанных: <b>{counts.get('ordered', 0)}</b>",
+        f"🔵 Доставленных: <b>{counts.get('delivered', 0)}</b>",
+        f"🔴 Просроченных: <b>{counts.get('overdue', 0)}</b>",
+        f"✅ Выполнено сегодня: <b>{counts.get('done_today', 0)}</b>",
+        f"📦 Всего активных: <b>{counts.get('total_active', 0)}</b>",
+    ]
+    return "\n".join(lines)
 
 
 def _save_report(text: str):

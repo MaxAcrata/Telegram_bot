@@ -11,16 +11,35 @@ logging.basicConfig(
 
 
 class RateLimiter:
-    """Скользящее окно rate limiting по user_id."""
+    """Скользящее окно rate limiting по user_id.
+    Автоматически очищает устаревшие записи каждые 100 вызовов."""
+
+    _CLEANUP_INTERVAL = 100
 
     def __init__(self, max_requests: int = 5, window_sec: int = 60):
         self._max = max_requests
         self._window = window_sec
         self._timestamps: dict[int, list[float]] = defaultdict(list)
+        self._call_count = 0
+
+    def _cleanup(self):
+        """Удаляет пользователей без активных записей."""
+        now = time.monotonic()
+        stale = [
+            uid
+            for uid, ts in self._timestamps.items()
+            if not ts or now - ts[-1] > self._window * 2
+        ]
+        for uid in stale:
+            del self._timestamps[uid]
 
     def is_allowed(self, user_id: int) -> bool:
         """Проверяет, не превышен ли лимит. Возвращает True если действие разрешено."""
         now = time.monotonic()
+        self._call_count += 1
+        if self._call_count >= self._CLEANUP_INTERVAL:
+            self._cleanup()
+            self._call_count = 0
         timestamps = self._timestamps[user_id]
         # Удаляем устаревшие
         self._timestamps[user_id] = [t for t in timestamps if now - t < self._window]
