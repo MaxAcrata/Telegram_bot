@@ -51,6 +51,7 @@ def test_make_links_clickable_empty():
 def test_format_task_html():
     """Тест форматирования задачи в HTML"""
     task = {
+        "id": 1,
         "name": "Кирпич",
         "quantity": 1000.0,
         "unit": "шт",
@@ -58,23 +59,27 @@ def test_format_task_html():
         "object": "Стройка А",
         "initiator": "Иван",
         "notes": "срочно",
+        "status": "new",
     }
 
     today = date(2023, 1, 5)
     result = format_task_html(task, today)
 
-    assert "<b>Кирпич</b>" in result
+    assert "#1" in result
+    assert "<b>#1 Кирпич</b>" in result
     assert "1000.0 шт" in result
     assert "Стройка А" in result
     assert "Иван" in result
     assert "01.01.2023" in result
     assert "Примечание:" in result
     assert "срочно" in result
+    assert "Новая" in result
 
 
 def test_format_task_html_overdue():
     """Просроченная задача показывает предупреждение"""
     task = {
+        "id": 1,
         "name": "Тест",
         "quantity": 1.0,
         "unit": "шт",
@@ -82,6 +87,7 @@ def test_format_task_html_overdue():
         "object": "О",
         "initiator": "И",
         "notes": "",
+        "status": "new",
     }
 
     today = date(2023, 1, 10)
@@ -94,24 +100,49 @@ def test_format_task_html_overdue():
 def test_format_task_html_ordered():
     """Заказанная задача показывает жёлтый индикатор"""
     task = {
+        "id": 1,
         "name": "Тест",
         "quantity": 1.0,
         "unit": "шт",
         "request_date": "2023-01-01",
         "object": "О",
         "initiator": "И",
-        "notes": "заказ оформлен",
+        "notes": "",
+        "status": "ordered",
     }
 
     today = date(2023, 1, 2)
     result = format_task_html(task, today)
 
     assert "🟡" in result
+    assert "Заказана" in result
+
+
+def test_format_task_html_delivered():
+    """Доставленная задача показывает синий индикатор"""
+    task = {
+        "id": 1,
+        "name": "Тест",
+        "quantity": 1.0,
+        "unit": "шт",
+        "request_date": "2023-01-01",
+        "object": "О",
+        "initiator": "И",
+        "notes": "",
+        "status": "delivered",
+    }
+
+    today = date(2023, 1, 2)
+    result = format_task_html(task, today)
+
+    assert "🔵" in result
+    assert "Доставлена" in result
 
 
 def test_format_task_html_with_link():
     """Тест отображения ссылки в примечании"""
     task = {
+        "id": 1,
         "name": "Материал",
         "quantity": 10.0,
         "unit": "шт",
@@ -119,6 +150,7 @@ def test_format_task_html_with_link():
         "object": "Объект",
         "initiator": "Иван",
         "notes": "Ссылка: https://example.com/catalog",
+        "status": "new",
     }
 
     today = date(2023, 1, 5)
@@ -131,6 +163,7 @@ def test_format_task_html_with_link():
 def test_format_task_html_notes_dash():
     """Тест что прочерк не отображается как примечание"""
     task = {
+        "id": 1,
         "name": "Материал",
         "quantity": 10.0,
         "unit": "шт",
@@ -138,6 +171,7 @@ def test_format_task_html_notes_dash():
         "object": "Объект",
         "initiator": "Иван",
         "notes": "-",
+        "status": "new",
     }
 
     today = date(2023, 1, 5)
@@ -149,6 +183,7 @@ def test_format_task_html_notes_dash():
 def test_format_task_html_with_photo_count():
     """Тест отображения количества фото"""
     task = {
+        "id": 1,
         "name": "Материал",
         "quantity": 10.0,
         "unit": "шт",
@@ -156,6 +191,7 @@ def test_format_task_html_with_photo_count():
         "object": "Объект",
         "initiator": "Иван",
         "notes": "",
+        "status": "new",
     }
 
     today = date(2023, 1, 5)
@@ -167,6 +203,7 @@ def test_format_task_html_with_photo_count():
 def test_format_task_html_no_photo_count():
     """Тест что при photo_count=0 метка не показывается"""
     task = {
+        "id": 1,
         "name": "Материал",
         "quantity": 10.0,
         "unit": "шт",
@@ -174,6 +211,7 @@ def test_format_task_html_no_photo_count():
         "object": "Объект",
         "initiator": "Иван",
         "notes": "",
+        "status": "new",
     }
 
     today = date(2023, 1, 5)
@@ -210,7 +248,7 @@ def test_build_report_with_tasks(mock_get, mock_photos):
             "initiator": "Иван",
             "notes": "",
             "done_date": None,
-            "status": "",
+            "status": "new",
             "id": 1,
         },
         {
@@ -220,9 +258,9 @@ def test_build_report_with_tasks(mock_get, mock_photos):
             "request_date": "2023-01-01",
             "object": "Стройка",
             "initiator": "Петр",
-            "notes": "заказ",
+            "notes": "",
             "done_date": None,
-            "status": "",
+            "status": "ordered",
             "id": 2,
         },
     ]
@@ -231,8 +269,8 @@ def test_build_report_with_tasks(mock_get, mock_photos):
     report, ids = build_report(save_to_file=False)
 
     assert "Всего активных: <b>2</b>" in report
-    assert "Заказано: <b>1</b>" in report
-    assert "Не заказано: <b>1</b>" in report
+    assert "Новая: <b>1</b>" in report
+    assert "Заказана: <b>1</b>" in report
     assert "Кирпич" in report
     assert "Цемент" in report
 
@@ -251,7 +289,7 @@ def test_build_report_overdue_section(mock_get, mock_photos):
             "initiator": "Иван",
             "notes": "",
             "done_date": None,
-            "status": "",
+            "status": "new",
             "id": 1,
         },
     ]
@@ -277,7 +315,7 @@ def test_build_report_with_links(mock_get, mock_photos):
             "initiator": "Иван",
             "notes": "Каталог: https://example.com",
             "done_date": None,
-            "status": "",
+            "status": "new",
             "id": 1,
         },
     ]
@@ -303,7 +341,7 @@ def test_build_report_photo_ids(mock_get, mock_photos):
             "initiator": "Иван",
             "notes": "",
             "done_date": None,
-            "status": "",
+            "status": "new",
             "id": 1,
         },
         {
@@ -315,7 +353,7 @@ def test_build_report_photo_ids(mock_get, mock_photos):
             "initiator": "Петр",
             "notes": "",
             "done_date": None,
-            "status": "",
+            "status": "new",
             "id": 2,
         },
     ]

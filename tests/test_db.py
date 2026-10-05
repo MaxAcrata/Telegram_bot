@@ -17,6 +17,17 @@ from db import (
     add_request_photo,
     get_request_photos,
     get_photo_counts,
+    complete_request,
+    update_request_status,
+    edit_request,
+    get_request_by_id,
+    audit_log,
+    get_audit_log,
+    backup_db,
+    save_conversation_state,
+    load_conversation_state,
+    clear_conversation_state,
+    VALID_STATUSES,
 )
 
 
@@ -24,7 +35,10 @@ from db import (
 def temp_db(tmp_path):
     """Создаёт временную БД для каждого теста."""
     db_path = str(tmp_path / "test.db")
-    with patch.object(db, "DB_PATH", db_path):
+    backup_dir = str(tmp_path / "backups")
+    with patch.object(db, "DB_PATH", db_path), patch.object(
+        db, "BACKUP_DIR", backup_dir
+    ):
         init_db()
         yield db_path
 
@@ -40,6 +54,8 @@ def test_init_db_creates_tables():
         ]
         assert "requests" in tables
         assert "lists" in tables
+        assert "audit_log" in tables
+        assert "conversation_state" in tables
 
 
 def test_init_db_populates_defaults():
@@ -50,6 +66,19 @@ def test_init_db_populates_defaults():
     assert "unit" in lists
     assert "шт" in lists["unit"]
     assert "Другое" in lists["initiator"]
+
+
+def test_init_db_does_not_overwrite_edited_defaults():
+    """init_db не перезаписывает отредактированные справочники"""
+    # Удаляем значение
+    db.delete_list_value("initiator", "Алексей")
+    lists = get_all_lists()
+    assert "Алексей" not in lists.get("initiator", [])
+
+    # Повторная инициализация — не должна вернуть удалённое
+    init_db()
+    lists = get_all_lists()
+    assert "Алексей" not in lists.get("initiator", [])
 
 
 def test_add_request():
@@ -70,6 +99,7 @@ def test_add_request():
     assert active[0]["name"] == "Кирпич"
     assert active[0]["quantity"] == 100.0
     assert active[0]["initiator"] == "Иван"
+    assert active[0]["status"] == "new"
 
 
 def test_get_active_requests_filters_done():
@@ -77,7 +107,6 @@ def test_get_active_requests_filters_done():
     add_request("A", 1, "шт", date(2025, 1, 1), "И", "О")
     add_request("B", 2, "кг", date(2025, 1, 2), "И", "О")
 
-    # Завершаем первую заявку
     with get_conn() as conn:
         conn.execute(
             "UPDATE requests SET done_date = ? WHERE name = ?",
@@ -176,3 +205,77 @@ def test_get_photo_counts_empty_list():
     """Пустой список ID возвращает пустой словарь"""
     result = get_photo_counts([])
     assert result == {}
+
+
+def test_complete_request():
+    """Заявка завершается"""
+    req_id = add_request("Тест", 1, "шт", date(2025, 1, 1), "И", "О")
+    result = complete_request(req_id, date(2025, 1, 10))
+    assert result is not None
+    assert result["done_date"] == "2025-01-10"
+    assert result["status"] == "done"
+
+
+def test_complete_request_idempotent():
+    """Повторное завершение не перезаписывает done_date"""
+    req_id = add_request("Тест", 1, "шт", date(2025, 1, 1), "И", "О")
+    complete_request(req_id, date(2025, 1, 10))
+    result = complete_request(req_id, date(2025, 2, 1))
+    assert result["done_date"] == "2025-01-10"  # Оригинальная дата
+
+
+def test_update_request_status():
+    """Статус заявки обновляется"""
+    req_id = add_request("Тест", 1, "шт", date(2025, 1, 1), "И", "О")
+    assert update_request_status(req_id, "ordered") is True
+    req = get_request_by_id(req_id)
+    assert req["status"] == "ordered"
+
+
+def test_update_request_status_invalid():
+    """Недопустимый статус отклоняется"""
+    req_id = add_request("Тест", 1, "шт", date(2025, 1, 1), "И", "О")
+    assert update_request_status(req_id, "invalid") is False
+
+
+def test_edit_request():
+    """Заявка редактируется"""
+    req_id = add_request("Тест", 1, "шт", date(2025, 1, 1), "И", "О")
+    assert edit_request(req_id, name="Новое имя", quantity=5.0) is True
+    req = get_request_by_id(req_id)
+    assert req["name"] == "Новое имя"
+    assert req["quantity"] == 5.0
+
+
+def test_audit_log():
+    """Записи аудита создаются и читаются"""
+    audit_log(1, 100, "Тест", "created", "Тестовая заявка")
+    audit_log(2, 100, "Тест", "completed", "")
+    entries = get_audit_log()
+    assert len(entries) >= 2
+    assert entries[0]["action"] == "completed"  # DESC order
+
+
+def test_audit_log_by_request():
+    """Фильтр аудита по ID заявки"""
+    audit_log(10, 100, "Тест", "created", "")
+    audit_log(20, 100, "Тест", "completed", "")
+    entries = get_audit_log(request_id=10)
+    assert all(e["request_id"] == 10 for e in entries)
+
+
+def test_backup_db():
+    """Резервная копия создаётся"""
+    path = backup_db()
+    assert path is not None
+    assert os.path.exists(path)
+
+
+def test_conversation_state():
+    """Сохранение и загрузка состояния диалога"""
+    save_conversation_state(123, '{"step": "NAME", "name": "Кирпич"}')
+    state = load_conversation_state(123)
+    assert "Кирпич" in state
+
+    clear_conversation_state(123)
+    assert load_conversation_state(123) is None

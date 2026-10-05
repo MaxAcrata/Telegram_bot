@@ -4,7 +4,12 @@ from datetime import datetime, timedelta, date
 from html import escape
 
 from config import OVERDUE_DAYS, REPORT_FILE_NAME
-from db import get_active_requests, get_completed_requests, get_photo_counts
+from db import (
+    get_active_requests,
+    get_completed_requests,
+    get_photo_counts,
+    STATUS_LABELS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -13,6 +18,14 @@ _URL_PATTERN = re.compile(
     r'https?://[^\s<>"\')\]]+|'  # http:// или https://
     r'www\.[^\s<>"\')\]]+'  # www.
 )
+
+# Эмодзи для статусов
+_STATUS_EMOJI = {
+    "new": "⚪",
+    "ordered": "🟡",
+    "delivered": "🔵",
+    "done": "🟢",
+}
 
 
 def make_links_clickable(text: str) -> str:
@@ -57,29 +70,28 @@ def format_task_html(task: dict, today: date, photo_count: int = 0) -> str:
     obj = escape(task.get("object", "Не указан"))
     initiator = escape(task.get("initiator", "Не указан"))
     notes_raw = task.get("notes") or ""
-    notes_lower = notes_raw.lower()
+    task_status = task.get("status", "new")
+    task_id = task.get("id", "?")
 
     req_date_str = task.get("request_date", "")
     req_date = date.fromisoformat(req_date_str) if req_date_str else None
 
-    # Статус
-    is_ordered = "заказ" in notes_lower
     days_elapsed = (today - req_date).days if req_date else 0
     is_overdue = days_elapsed > OVERDUE_DAYS
 
-    # Эмодзи-индикаторы
-    if is_overdue:
+    # Эмодзи на основе явного статуса
+    status_emoji = _STATUS_EMOJI.get(task_status, "⚪")
+    status_label = STATUS_LABELS.get(task_status, task_status)
+
+    if is_overdue and task_status not in ("done", "delivered"):
         status_emoji = "🔴"
-    elif is_ordered:
-        status_emoji = "🟡"
-    else:
-        status_emoji = "⚪"
 
     qty_text = f"{qty} {unit}".strip() if qty else "—"
     date_text = req_date.strftime("%d.%m.%Y") if req_date else "нет даты"
 
     lines = [
-        f"{status_emoji} <b>{name}</b>",
+        f"{status_emoji} <b>#{task_id} {name}</b>",
+        f"   └ Статус: {status_label}",
         f"   └ Кол-во: <code>{qty_text}</code>",
         f"   └ Инициатор: {initiator}",
         f"   └ Объект: {obj}",
@@ -94,7 +106,7 @@ def format_task_html(task: dict, today: date, photo_count: int = 0) -> str:
     if photo_count:
         lines.append(f"   └ 📎 Фото: {photo_count} шт.")
 
-    if is_overdue:
+    if is_overdue and task_status not in ("done", "delivered"):
         lines.append(f"   └ ⚠️ Просрочено на {days_elapsed} дн.")
 
     return "\n".join(lines)
@@ -147,8 +159,9 @@ def _build_completed_report(today: date, save_to_file: bool) -> tuple:
         done_text = done_date.strftime("%d.%m.%Y") if done_date else "—"
         qty_text = f"{qty} {unit}".strip() if qty else "—"
         notes_raw = task.get("notes") or ""
+        task_id = task.get("id", "?")
 
-        report.append(f"✅ <b>{name}</b>")
+        report.append(f"✅ <b>#{task_id} {name}</b>")
         report.append(f"   └ Кол-во: <code>{qty_text}</code>")
         report.append(f"   └ Инициатор: {initiator}")
         report.append(f"   └ Объект: {obj}")
@@ -177,9 +190,9 @@ def _build_active_report(today: date, save_to_file: bool) -> tuple:
     active_tasks = get_active_requests()
 
     report = [
-        "<b> СВОДКА ПО АКТИВНЫМ ЗАЯВКАМ</b>",
-        f" Дата: {today.strftime('%d.%m.%Y')}",
-        f" Всего активных: <b>{len(active_tasks)}</b>",
+        "<b>📋 СВОДКА ПО АКТИВНЫМ ЗАЯВКАМ</b>",
+        f"📅 Дата: {today.strftime('%d.%m.%Y')}",
+        f"📊 Всего активных: <b>{len(active_tasks)}</b>",
         "━━━━━━━━━━━━━━━━━━━━",
     ]
 
@@ -190,37 +203,39 @@ def _build_active_report(today: date, save_to_file: bool) -> tuple:
             _save_report(result)
         return result, []
 
-    # Статистика
-    ordered = [t for t in active_tasks if "заказ" in (t.get("notes") or "").lower()]
+    # Статистика по явным статусам
+    by_status = {}
+    for t in active_tasks:
+        st = t.get("status", "new")
+        by_status[st] = by_status.get(st, 0) + 1
+
     overdue = [
         t
         for t in active_tasks
         if t.get("request_date")
         and date.fromisoformat(t["request_date"]) < today - timedelta(days=OVERDUE_DAYS)
+        and t.get("status") not in ("done", "delivered")
     ]
 
-    report.extend(
-        [
-            f" Заказано: <b>{len(ordered)}</b>",
-            f" Не заказано: <b>{len(active_tasks) - len(ordered)}</b>",
-            f" Просрочено (&gt;{OVERDUE_DAYS} дн.): <b>{len(overdue)}</b>",
-            "━━━━━━━━━━━━━━━━━━━━",
-            "",
-        ]
-    )
+    for st_key, st_label in STATUS_LABELS.items():
+        if st_key in by_status and st_key != "done":
+            report.append(f"  {st_label}: <b>{by_status[st_key]}</b>")
 
-    # Группировка по объектам
-    from itertools import groupby
+    report.append(f"  Просрочено (&gt;{OVERDUE_DAYS} дн.): <b>{len(overdue)}</b>")
+    report.extend(["━━━━━━━━━━━━━━━━━━━━", ""])
 
     # Получаем количество фото для всех заявок
     task_ids = [t["id"] for t in active_tasks]
     photo_counts = get_photo_counts(task_ids)
     ids_with_photos = [rid for rid, cnt in photo_counts.items() if cnt > 0]
 
+    # Группировка по объектам
+    from itertools import groupby
+
     sorted_tasks = sorted(active_tasks, key=lambda t: t.get("object", ""))
     for obj, group_iter in groupby(sorted_tasks, key=lambda t: t.get("object", "")):
         group = list(group_iter)
-        report.append(f"\n <b>Объект: {escape(obj)}</b>")
+        report.append(f"\n<b>🏗️ Объект: {escape(obj)}</b>")
         for task in group:
             pc = photo_counts.get(task["id"], 0)
             report.append(format_task_html(task, today, photo_count=pc))
@@ -231,7 +246,7 @@ def _build_active_report(today: date, save_to_file: bool) -> tuple:
         report.extend(
             [
                 "",
-                " <b>⚠️ ПРОСРОЧЕННЫЕ ЗАЯВКИ</b>",
+                "<b>⚠️ ПРОСРОЧЕННЫЕ ЗАЯВКИ</b>",
                 "━━━━━━━━━━━━━━━━━━━━",
             ]
         )
@@ -240,7 +255,7 @@ def _build_active_report(today: date, save_to_file: bool) -> tuple:
             sorted_overdue, key=lambda t: t.get("initiator", "")
         ):
             group = list(group_iter)
-            report.append(f"\n 👤 <b>{escape(initiator)}</b> — {len(group)} шт.")
+            report.append(f"\n👤 <b>{escape(initiator)}</b> — {len(group)} шт.")
             for task in group:
                 name = escape(task.get("name", "—"))
                 obj = escape(task.get("object", "—"))
@@ -250,7 +265,10 @@ def _build_active_report(today: date, save_to_file: bool) -> tuple:
                 days = (today - req_date).days if req_date else 0
                 pc = photo_counts.get(task["id"], 0)
                 photo_label = f" 📎{pc}" if pc else ""
-                report.append(f"    • {name} ({obj}) — {days} дн.{photo_label}")
+                task_id = task.get("id", "?")
+                report.append(
+                    f"    • #{task_id} {name} ({obj}) — {days} дн.{photo_label}"
+                )
                 if notes_raw and notes_raw != "-":
                     notes_html = make_links_clickable(notes_raw)
                     report.append(f"      Примечание: {notes_html}")

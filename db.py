@@ -1,10 +1,12 @@
 import logging
+import shutil
 import sqlite3
 from datetime import datetime, date
+from pathlib import Path
 from typing import Optional, List, Dict
 from contextlib import contextmanager
 
-from config import DB_PATH
+from config import DB_PATH, BACKUP_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +28,7 @@ CREATE TABLE IF NOT EXISTS requests (
     request_date DATE NOT NULL,
     done_date DATE,
     initiator TEXT DEFAULT '',
-    status TEXT DEFAULT '',
+    status TEXT DEFAULT 'new',
     object TEXT DEFAULT '',
     notes TEXT DEFAULT ''
 );
@@ -49,23 +51,51 @@ CREATE TABLE IF NOT EXISTS request_photos (
     created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT DEFAULT CURRENT_TIMESTAMP,
+    request_id INTEGER,
+    user_id INTEGER,
+    user_name TEXT DEFAULT '',
+    action TEXT NOT NULL,
+    details TEXT DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS conversation_state (
+    user_id INTEGER PRIMARY KEY,
+    state_data TEXT NOT NULL,
+    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE INDEX IF NOT EXISTS idx_requests_active ON requests(done_date, request_date);
 CREATE INDEX IF NOT EXISTS idx_requests_object ON requests(object);
+CREATE INDEX IF NOT EXISTS idx_requests_status ON requests(status);
 CREATE INDEX IF NOT EXISTS idx_request_photos_req ON request_photos(request_id);
+CREATE INDEX IF NOT EXISTS idx_audit_log_req ON audit_log(request_id);
+CREATE INDEX IF NOT EXISTS idx_audit_log_ts ON audit_log(timestamp);
 """
 
-# Значения настроек по умолчанию
+# Значения настроек по умолчанию (НЕ перезаписывают существующие)
 _DEFAULT_SETTINGS = {
     "buttons_per_row_object": "2",
     "buttons_per_row_initiator": "4",
     "buttons_per_row_unit": "3",
 }
 
-# Значения по умолчанию для справочников
+# Значения по умолчанию для справочников (только для пустой БД)
 _DEFAULT_LISTS = {
     "initiator": ["Алексей", "Анатолий", "Михаил", "Игорь"],
     "object": ["Солнечное", "Привилегия"],
     "unit": ["шт", "кг", "л", "м2", "м3", "лист", "м.п.", "комп"],
+}
+
+# Допустимые статусы заявок
+VALID_STATUSES = ("new", "ordered", "delivered", "done")
+STATUS_LABELS = {
+    "new": "Новая",
+    "ordered": "Заказана",
+    "delivered": "Доставлена",
+    "done": "Выполнена",
 }
 
 
@@ -86,26 +116,175 @@ def get_conn():
         conn.close()
 
 
+def _table_exists(conn, table_name: str) -> bool:
+    """Проверяет существование таблицы."""
+    row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+        (table_name,),
+    ).fetchone()
+    return row is not None
+
+
+def _column_exists(conn, table_name: str, column_name: str) -> bool:
+    """Проверяет существование колонки в таблице."""
+    try:
+        rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+        return any(row["name"] == column_name for row in rows)
+    except Exception:
+        return False
+
+
 def init_db():
-    """Инициализирует БД: создаёт таблицы и заполняет справочники по умолчанию."""
+    """Инициализирует БД: создаёт таблицы, мигрирует схему, заполняет пустые справочники."""
     with get_conn() as conn:
         conn.executescript(_SCHEMA)
 
-        # Заполняем справочники, если пустые
-        for list_type, values in _DEFAULT_LISTS.items():
-            for i, value in enumerate(values):
-                conn.execute(
-                    "INSERT OR IGNORE INTO lists (list_type, value, sort_order) VALUES (?, ?, ?)",
-                    (list_type, value, i),
-                )
+        # Миграция: добавляем status если нет
+        if not _column_exists(conn, "requests", "status"):
+            conn.execute("ALTER TABLE requests ADD COLUMN status TEXT DEFAULT 'new'")
+            logger.info("Миграция: добавлена колонка status в requests")
 
-        # Заполняем настройки по умолчанию
+        # Заполняем справочники ТОЛЬКО если таблица пустая
+        for list_type, values in _DEFAULT_LISTS.items():
+            count = conn.execute(
+                "SELECT COUNT(*) FROM lists WHERE list_type = ?", (list_type,)
+            ).fetchone()[0]
+            if count == 0:
+                for i, value in enumerate(values):
+                    conn.execute(
+                        "INSERT INTO lists (list_type, value, sort_order) VALUES (?, ?, ?)",
+                        (list_type, value, i),
+                    )
+
+        # Заполняем настройки по умолчанию ТОЛЬКО если ключа нет
         for key, value in _DEFAULT_SETTINGS.items():
             conn.execute(
                 "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
                 (key, value),
             )
+
     logger.info(f"БД инициализирована: {DB_PATH}")
+
+
+# ===== Audit Log =====
+
+
+def audit_log(
+    request_id: Optional[int],
+    user_id: Optional[int],
+    user_name: str,
+    action: str,
+    details: str = "",
+):
+    """Записывает действие в журнал аудита."""
+    try:
+        with get_conn() as conn:
+            conn.execute(
+                """INSERT INTO audit_log (request_id, user_id, user_name, action, details)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (request_id, user_id, user_name, action, details),
+            )
+    except Exception as e:
+        logger.warning(f"audit_log ошибка: {e}")
+
+
+def get_audit_log(request_id: Optional[int] = None, limit: int = 50) -> List[dict]:
+    """Возвращает записи журнала аудита."""
+    try:
+        with get_conn() as conn:
+            if request_id:
+                rows = conn.execute(
+                    """SELECT * FROM audit_log WHERE request_id = ?
+                       ORDER BY timestamp DESC LIMIT ?""",
+                    (request_id, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM audit_log ORDER BY timestamp DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        logger.warning(f"get_audit_log ошибка: {e}")
+        return []
+
+
+# ===== Backup =====
+
+
+def backup_db() -> Optional[str]:
+    """Создаёт резервную копию БД через SQLite backup API. Возвращает путь к копии."""
+    try:
+        backup_dir = Path(BACKUP_DIR)
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_path = backup_dir / f"bot_backup_{timestamp}.db"
+
+        source = sqlite3.connect(DB_PATH)
+        dest = sqlite3.connect(str(backup_path))
+        source.backup(dest)
+        dest.close()
+        source.close()
+
+        logger.info(f"Резервная копия создана: {backup_path}")
+        return str(backup_path)
+    except Exception as e:
+        logger.error(f"Ошибка создания резервной копии: {e}")
+        return None
+
+
+def verify_backup(backup_path: str) -> bool:
+    """Проверяет целостность резервной копии."""
+    try:
+        conn = sqlite3.connect(backup_path)
+        result = conn.execute("PRAGMA integrity_check").fetchone()
+        conn.close()
+        return result[0] == "ok"
+    except Exception as e:
+        logger.error(f"Ошибка проверки резервной копии: {e}")
+        return False
+
+
+# ===== Persistent Conversation State =====
+
+
+def save_conversation_state(user_id: int, state_data: str):
+    """Сохраняет состояние диалога пользователя."""
+    try:
+        with get_conn() as conn:
+            conn.execute(
+                """INSERT INTO conversation_state (user_id, state_data, updated_at)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(user_id) DO UPDATE SET
+                       state_data = excluded.state_data,
+                       updated_at = excluded.updated_at""",
+                (user_id, state_data, datetime.now().isoformat()),
+            )
+    except Exception as e:
+        logger.warning(f"save_conversation_state ошибка: {e}")
+
+
+def load_conversation_state(user_id: int) -> Optional[str]:
+    """Загружает состояние диалога пользователя."""
+    try:
+        with get_conn() as conn:
+            row = conn.execute(
+                "SELECT state_data FROM conversation_state WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+        return row["state_data"] if row else None
+    except Exception as e:
+        logger.warning(f"load_conversation_state ошибка: {e}")
+        return None
+
+
+def clear_conversation_state(user_id: int):
+    """Удаляет сохранённое состояние диалога."""
+    try:
+        with get_conn() as conn:
+            conn.execute("DELETE FROM conversation_state WHERE user_id = ?", (user_id,))
+    except Exception as e:
+        logger.warning(f"clear_conversation_state ошибка: {e}")
 
 
 # ===== Запросы (requests) =====
@@ -119,13 +298,15 @@ def add_request(
     initiator: str,
     object_name: str,
     notes: str = "",
+    user_id: Optional[int] = None,
+    user_name: str = "",
 ) -> int:
     """Добавляет заявку и возвращает её ID."""
     with get_conn() as conn:
         cursor = conn.execute(
             """INSERT INTO requests
-               (name, quantity, unit, request_date, initiator, object, notes)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+               (name, quantity, unit, request_date, initiator, object, notes, status)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'new')""",
             (
                 name,
                 quantity,
@@ -138,6 +319,7 @@ def add_request(
         )
         row_id = cursor.lastrowid
     logger.info(f"Заявка #{row_id} добавлена: {name}")
+    audit_log(row_id, user_id, user_name, "created", f"Наименование: {name}")
     return row_id
 
 
@@ -150,13 +332,15 @@ def add_request_with_photos(
     object_name: str,
     notes: str = "",
     photo_file_ids: Optional[List[str]] = None,
+    user_id: Optional[int] = None,
+    user_name: str = "",
 ) -> int:
     """Добавляет заявку и фото в одной транзакции. Возвращает ID заявки."""
     with get_conn() as conn:
         cursor = conn.execute(
             """INSERT INTO requests
-               (name, quantity, unit, request_date, initiator, object, notes)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+               (name, quantity, unit, request_date, initiator, object, notes, status)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'new')""",
             (
                 name,
                 quantity,
@@ -176,26 +360,146 @@ def add_request_with_photos(
     logger.info(
         f"Заявка #{row_id} добавлена: {name} (фото: {len(photo_file_ids or [])})"
     )
+    audit_log(
+        row_id,
+        user_id,
+        user_name,
+        "created",
+        f"Наименование: {name}, фото: {len(photo_file_ids or [])}",
+    )
     return row_id
 
 
+def update_request_status(
+    request_id: int,
+    new_status: str,
+    user_id: Optional[int] = None,
+    user_name: str = "",
+) -> bool:
+    """Обновляет статус заявки. Возвращает True если успешно."""
+    if new_status not in VALID_STATUSES:
+        logger.warning(f"Недопустимый статус: {new_status}")
+        return False
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT status FROM requests WHERE id = ?", (request_id,)
+        ).fetchone()
+        if not row:
+            return False
+        old_status = row["status"]
+        if old_status == new_status:
+            return True
+        conn.execute(
+            "UPDATE requests SET status = ? WHERE id = ?",
+            (new_status, request_id),
+        )
+    audit_log(
+        request_id,
+        user_id,
+        user_name,
+        "status_changed",
+        f"{old_status} → {new_status}",
+    )
+    return True
+
+
+def edit_request(
+    request_id: int,
+    name: Optional[str] = None,
+    quantity: Optional[float] = None,
+    unit: Optional[str] = None,
+    object_name: Optional[str] = None,
+    notes: Optional[str] = None,
+    user_id: Optional[int] = None,
+    user_name: str = "",
+) -> bool:
+    """Редактирует заявку. Обновляет только переданные поля."""
+    fields = []
+    values = []
+    changes = []
+    if name is not None:
+        fields.append("name = ?")
+        values.append(name)
+        changes.append(f"наименование: {name}")
+    if quantity is not None:
+        fields.append("quantity = ?")
+        values.append(quantity)
+        changes.append(f"кол-во: {quantity}")
+    if unit is not None:
+        fields.append("unit = ?")
+        values.append(unit)
+        changes.append(f"ед.изм: {unit}")
+    if object_name is not None:
+        fields.append("object = ?")
+        values.append(object_name)
+        changes.append(f"объект: {object_name}")
+    if notes is not None:
+        fields.append("notes = ?")
+        values.append(notes)
+        changes.append(f"примечание: {notes}")
+
+    if not fields:
+        return False
+
+    values.append(request_id)
+    with get_conn() as conn:
+        conn.execute(f"UPDATE requests SET {', '.join(fields)} WHERE id = ?", values)
+    audit_log(request_id, user_id, user_name, "edited", "; ".join(changes))
+    return True
+
+
 def clear_all_requests():
-    """Удаляет все заявки и связанные фото. Возвращает количество удалённых заявок."""
+    """Удаляет все заявки и связанные фото. Сначала создаёт резервную копию."""
+    backup_path = backup_db()
+    if backup_path:
+        if verify_backup(backup_path):
+            logger.info(f"Резервная копия подтверждена: {backup_path}")
+        else:
+            logger.error("Резервная копия не прошла проверку — очистка отменена")
+            raise RuntimeError("Резервная копия БД не прошла проверку целостности")
+
     with get_conn() as conn:
         count = conn.execute("SELECT COUNT(*) FROM requests").fetchone()[0]
         conn.execute("DELETE FROM request_photos")
         conn.execute("DELETE FROM requests")
+        conn.execute("DELETE FROM audit_log")
     logger.warning(f"Очищена БД: удалено {count} заявок")
+    audit_log(None, None, "system", "db_cleared", f"Удалено заявок: {count}")
+    return count
+
+
+def archive_completed_requests(days_old: int = 90) -> int:
+    """Архивирует заявки старше указанного количества дней (помечает status='archived').
+    Возвращает количество архивированных заявок."""
+    cutoff = date.today().toordinal() - days_old
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT id FROM requests
+               WHERE done_date IS NOT NULL
+               AND status = 'done'
+               AND julianday(done_date) < julianday(?, 'unixepoch')""",
+            (cutoff,),
+        ).fetchall()
+        for row in rows:
+            conn.execute(
+                "UPDATE requests SET status = 'archived' WHERE id = ?",
+                (row["id"],),
+            )
+    count = len(rows)
+    if count:
+        logger.info(f"Архивировано {count} заявок старше {days_old} дней")
+        audit_log(None, None, "system", "archived", f"Архивировано: {count}")
     return count
 
 
 def get_active_requests() -> List[dict]:
-    """Возвращает активные заявки (без done_date), отсортированные по объекту."""
+    """Возвращает активные заявки (без done_date, status != archived), отсортированные по объекту."""
     with get_conn() as conn:
         rows = conn.execute("""SELECT id, name, quantity, unit, request_date, done_date,
                       initiator, status, object, notes
                FROM requests
                WHERE done_date IS NULL AND request_date IS NOT NULL
+               AND status != 'archived'
                ORDER BY object, request_date""").fetchall()
     return [dict(r) for r in rows]
 
@@ -292,22 +596,64 @@ def set_setting(key: str, value: str):
         )
 
 
-def complete_request(request_id: int, done_date: date) -> Optional[dict]:
-    """Отмечает заявку как выполненную. Возвращает данные заявки или None."""
+def complete_request(
+    request_id: int,
+    done_date: date,
+    user_id: Optional[int] = None,
+    user_name: str = "",
+) -> Optional[dict]:
+    """Отмечает заявку как выполненную. Идемпотентна — не перезаписывает done_date."""
     with get_conn() as conn:
         row = conn.execute(
             "SELECT * FROM requests WHERE id = ?", (request_id,)
         ).fetchone()
         if not row:
             return None
+        result = dict(row)
+        # Идемпотентность: не перезаписываем, если уже завершена
+        if row["done_date"]:
+            return result
         conn.execute(
-            "UPDATE requests SET done_date = ? WHERE id = ?",
+            "UPDATE requests SET done_date = ?, status = 'done' WHERE id = ?",
             (done_date.isoformat(), request_id),
         )
-    result = dict(row)
     result["done_date"] = done_date.isoformat()
+    result["status"] = "done"
     logger.info(f"Заявка #{request_id} завершена")
+    audit_log(
+        request_id, user_id, user_name, "completed", f"Дата: {done_date.isoformat()}"
+    )
     return result
+
+
+def complete_requests_batch(
+    request_ids: List[int],
+    done_date: date,
+    user_id: Optional[int] = None,
+    user_name: str = "",
+) -> int:
+    """Завершает несколько заявок. Возвращает количество завершённых."""
+    completed = 0
+    with get_conn() as conn:
+        for req_id in request_ids:
+            row = conn.execute(
+                "SELECT done_date FROM requests WHERE id = ?", (req_id,)
+            ).fetchone()
+            if row and not row["done_date"]:
+                conn.execute(
+                    "UPDATE requests SET done_date = ?, status = 'done' WHERE id = ?",
+                    (done_date.isoformat(), req_id),
+                )
+                completed += 1
+    if completed:
+        audit_log(
+            None,
+            user_id,
+            user_name,
+            "batch_completed",
+            f"Завершено {completed} заявок: {request_ids}",
+        )
+    return completed
 
 
 def get_completed_requests(limit: int = 50) -> List[dict]:
@@ -317,10 +663,91 @@ def get_completed_requests(limit: int = 50) -> List[dict]:
             """SELECT id, name, quantity, unit, request_date, done_date,
                       initiator, status, object, notes
                FROM requests
-               WHERE done_date IS NOT NULL
+               WHERE done_date IS NOT NULL AND status != 'archived'
                ORDER BY done_date DESC
                LIMIT ?""",
             (limit,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_request_by_id(request_id: int) -> Optional[dict]:
+    """Возвращает заявку по ID."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM requests WHERE id = ?", (request_id,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def get_user_requests(
+    initiator: str, status_filter: Optional[str] = None, limit: int = 50
+) -> List[dict]:
+    """Возвращает заявки конкретного инициатора."""
+    with get_conn() as conn:
+        if status_filter and status_filter == "active":
+            rows = conn.execute(
+                """SELECT id, name, quantity, unit, request_date, done_date,
+                          initiator, status, object, notes
+                   FROM requests
+                   WHERE initiator = ? AND done_date IS NULL AND status != 'archived'
+                   ORDER BY request_date DESC LIMIT ?""",
+                (initiator, limit),
+            ).fetchall()
+        elif status_filter and status_filter == "completed":
+            rows = conn.execute(
+                """SELECT id, name, quantity, unit, request_date, done_date,
+                          initiator, status, object, notes
+                   FROM requests
+                   WHERE initiator = ? AND done_date IS NOT NULL AND status != 'archived'
+                   ORDER BY done_date DESC LIMIT ?""",
+                (initiator, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT id, name, quantity, unit, request_date, done_date,
+                          initiator, status, object, notes
+                   FROM requests
+                   WHERE initiator = ? AND status != 'archived'
+                   ORDER BY request_date DESC LIMIT ?""",
+                (initiator, limit),
+            ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def search_requests(
+    query: str,
+    object_filter: Optional[str] = None,
+    initiator_filter: Optional[str] = None,
+    limit: int = 20,
+) -> List[dict]:
+    """Поиск заявок по наименованию/примечанию с фильтрами."""
+    conditions = ["status != 'archived'"]
+    params: list = []
+
+    if query:
+        conditions.append("(name LIKE ? OR notes LIKE ?)")
+        params.extend([f"%{query}%", f"%{query}%"])
+
+    if object_filter:
+        conditions.append("object = ?")
+        params.append(object_filter)
+
+    if initiator_filter:
+        conditions.append("initiator = ?")
+        params.append(initiator_filter)
+
+    where = " AND ".join(conditions)
+    params.append(limit)
+
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"""SELECT id, name, quantity, unit, request_date, done_date,
+                       initiator, status, object, notes
+                FROM requests
+                WHERE {where}
+                ORDER BY request_date DESC LIMIT ?""",
+            params,
         ).fetchall()
     return [dict(r) for r in rows]
 
@@ -357,7 +784,6 @@ def get_photo_counts(request_ids: List[int]) -> Dict[int, int]:
         return {}
     try:
         result = {}
-        # SQLite лимит на placeholders — 999, разбиваем на батчи
         batch_size = 900
         for i in range(0, len(request_ids), batch_size):
             batch = request_ids[i : i + batch_size]

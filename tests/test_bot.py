@@ -42,6 +42,7 @@ def make_context():
     context = MagicMock()
     context.user_data = {}
     context.bot.send_message = AsyncMock()
+    context.bot_data = {}
     return context
 
 
@@ -64,6 +65,7 @@ def test_get_main_keyboard_admin():
     text = str(kb)
     assert "📊 Анализ" in text
     assert "➕ Добавить заявку" in text
+    assert "📋 Мои заявки" in text
 
 
 @patch("bot.ADMIN_IDS", [111])
@@ -72,14 +74,16 @@ def test_get_main_keyboard_user():
     text = str(kb)
     assert "➕ Добавить заявку" in text
     assert "📊 Анализ" not in text
+    assert "📋 Мои заявки" in text
 
 
 # ===== Тесты отмены =====
 
 
 @pytest.mark.asyncio
+@patch("bot.clear_conversation_state")
 @patch("bot.ADMIN_IDS", [123])
-async def test_cancel_clears_user_data():
+async def test_cancel_clears_user_data(mock_clear):
     update = make_update(user_id=123)
     context = make_context()
     context.user_data["name"] = "test"
@@ -88,21 +92,37 @@ async def test_cancel_clears_user_data():
 
     assert result == ConversationHandler.END
     assert context.user_data == {}
+    mock_clear.assert_called_once_with(123)
 
 
 # ===== Тесты начала диалога =====
 
 
 @pytest.mark.asyncio
+@patch("bot.rate_limiter")
 @patch("bot.ADMIN_IDS", [123])
-async def test_start_add_request():
+async def test_start_add_request(mock_limiter):
+    mock_limiter.is_allowed.return_value = True
     update = make_update(user_id=123)
     context = make_context()
 
     result = await start_add_request(update, context)
 
     assert result == NAME
-    assert context.user_data == {}
+    assert "draft_id" in context.user_data
+
+
+@pytest.mark.asyncio
+@patch("bot.rate_limiter")
+@patch("bot.ADMIN_IDS", [123])
+async def test_start_add_request_rate_limited(mock_limiter):
+    mock_limiter.is_allowed.return_value = False
+    update = make_update(user_id=123)
+    context = make_context()
+
+    result = await start_add_request(update, context)
+
+    assert result == ConversationHandler.END
 
 
 # ===== Тесты шагов диалога =====
@@ -113,7 +133,8 @@ async def test_set_name():
     update = make_update(text="Кирпич")
     context = make_context()
 
-    result = await set_name(update, context)
+    with patch("bot._save_draft"):
+        result = await set_name(update, context)
 
     assert result == QUANTITY
     assert context.user_data["name"] == "Кирпич"
@@ -124,7 +145,8 @@ async def test_set_quantity_valid():
     update = make_update(text="10")
     context = make_context()
 
-    result = await set_quantity(update, context)
+    with patch("bot._save_draft"):
+        result = await set_quantity(update, context)
 
     assert result == UNIT
     assert context.user_data["quantity"] == "10"
@@ -150,15 +172,19 @@ async def test_set_quantity_invalid():
         "object": ["Объект1"],
     },
 )
-async def test_set_unit(mock_lists):
+@patch("bot.get_setting", return_value="3")
+async def test_set_unit(mock_setting, mock_lists):
     update = make_update(text="шт")
+    update.effective_user.id = 123
     context = make_context()
 
-    result = await set_unit(update, context)
+    with patch("bot.get_initiator_by_tg_id", return_value=None), patch(
+        "bot._save_draft"
+    ):
+        result = await set_unit(update, context)
 
     assert result == INITIATOR
     assert context.user_data["unit"] == "шт"
-    mock_lists.assert_called_once()
 
 
 # ===== Тесты подтверждения =====
@@ -176,7 +202,8 @@ async def test_set_notes_shows_confirmation():
         "object": "Стройка",
     }
 
-    result = await set_notes_and_save(update, context)
+    with patch("bot._save_draft"):
+        result = await set_notes_and_save(update, context)
 
     assert result == PHOTO
     assert context.user_data["notes"] == "Срочно"
@@ -187,10 +214,10 @@ async def test_set_notes_shows_confirmation():
 
 
 @pytest.mark.asyncio
-@patch("bot.add_request_photo")
+@patch("bot.clear_conversation_state")
 @patch("bot.add_request_with_photos", return_value=1)
 @patch("bot.ADMIN_IDS", [123])
-async def test_confirm_request_saves(mock_add, mock_photo):
+async def test_confirm_request_saves(mock_add, mock_clear):
     update = make_update(text="✅ Подтвердить", user_id=123)
     context = make_context()
     context.user_data = {
@@ -211,8 +238,9 @@ async def test_confirm_request_saves(mock_add, mock_photo):
 
 
 @pytest.mark.asyncio
+@patch("bot.clear_conversation_state")
 @patch("bot.ADMIN_IDS", [123])
-async def test_confirm_request_cancel():
+async def test_confirm_request_cancel(mock_clear):
     update = make_update(text="❌ Отмена", user_id=123)
     context = make_context()
     context.user_data = {"name": "Кирпич"}
