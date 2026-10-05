@@ -73,7 +73,18 @@ def _validate_config():
 TELEGRAM_BOT_TOKEN = _require_env("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = _require_env("TELEGRAM_CHAT_ID")
 ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "")
-ADMIN_IDS = [int(x.strip()) for x in ADMIN_IDS_RAW.split(",") if x.strip()]
+ADMIN_IDS = []
+for _x in ADMIN_IDS_RAW.split(","):
+    _x = _x.strip()
+    if _x:
+        try:
+            ADMIN_IDS.append(int(_x))
+        except ValueError:
+            print(
+                f"❌ ADMIN_IDS: невозможно преобразовать '{_x}' в число. "
+                f"Пропускается.",
+                file=sys.stderr,
+            )
 
 # ===== DATABASE =====
 # По умолчанию bot.db рядом с bot.py (для локального запуска).

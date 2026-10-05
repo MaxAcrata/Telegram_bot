@@ -34,7 +34,7 @@ from config import (
     MAX_FIELD_LENGTH,
     MAX_PHOTOS_PER_REQUEST,
 )
-from core import build_report
+from core import build_report, build_dashboard
 from db import (
     init_db,
     get_all_lists,
@@ -65,6 +65,9 @@ from db import (
     get_request_by_id,
     get_user_requests,
     search_requests,
+    is_request_owner,
+    delete_request,
+    get_requests_by_status,
     VALID_STATUSES,
     STATUS_LABELS,
 )
@@ -115,6 +118,15 @@ STATUS_SELECT, STATUS_CONFIRM = range(110, 112)
 # ===== СОСТОЯНИЯ ПОИСКА/ФИЛЬТРОВ =====
 MY_REQUESTS_SELECT = 120
 
+# ===== СОСТОЯНИЯ РАЗДЕЛА «ЗАЯВКИ» =====
+REQUESTS_LIST, REQUESTS_CARD = 130, 131
+
+# ===== СОСТОЯНИЯ РЕДАКТИРОВАНИЯ ЗАЯВКИ =====
+EDIT_SELECT_FIELD, EDIT_INPUT_VALUE = 140, 141
+
+# ===== СОСТОЯНИЯ УДАЛЕНИЯ ЗАЯВКИ =====
+DELETE_CONFIRM = 145
+
 # ===== КЛАВИАТУРА ОТМЕНЫ =====
 CANCEL_KEYBOARD = ReplyKeyboardMarkup(
     [["❌ Отмена"]], resize_keyboard=True, one_time_keyboard=False
@@ -137,6 +149,7 @@ def get_main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
     """Возвращает главную клавиатуру в зависимости от прав"""
     if is_admin(user_id):
         keyboard = [
+            ["📋 Заявки", "📊 Дашборд"],
             ["📊 Анализ"],
             ["➕ Добавить заявку"],
             ["✅ Завершить заявку"],
@@ -284,11 +297,20 @@ def _build_pagination_keyboard(
 
 
 async def show_request_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Отправляет фото заявки по нажатию inline-кнопки"""
+    """Отправляет фото заявки по нажатию inline-кнопки.
+    Проверка прав: только админ или инициатор заявки."""
     query = update.callback_query
     await query.answer()
 
+    user_id = update.effective_user.id
     req_id = int(query.data.split(":")[1])
+
+    if not is_admin(user_id) and not is_request_owner(req_id, user_id):
+        await _safe_send(
+            context, query.message.chat_id, "⛔ У вас нет доступа к этой заявке."
+        )
+        return
+
     file_ids = get_request_photos(req_id)
 
     if not file_ids:
@@ -318,11 +340,20 @@ async def show_request_photos(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def show_request_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает детали заявки по нажатию inline-кнопки из отчёта"""
+    """Показывает детали заявки по нажатию inline-кнопки из отчёта.
+    Проверка прав: только админ или инициатор заявки."""
     query = update.callback_query
     await query.answer()
 
+    user_id = update.effective_user.id
     req_id = int(query.data.split(":")[1])
+
+    if not is_admin(user_id) and not is_request_owner(req_id, user_id):
+        await _safe_send(
+            context, query.message.chat_id, "⛔ У вас нет доступа к этой заявке."
+        )
+        return
+
     req = get_request_by_id(req_id)
 
     if not req:
@@ -827,7 +858,8 @@ async def handle_photo_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     keyboard = ReplyKeyboardMarkup(
-        [["✅ Подтвердить", "❌ Отмена"]], resize_keyboard=True
+        [["✅ Подтвердить", "✏️ Исправить"], ["❌ Отмена"]],
+        resize_keyboard=True,
     )
 
     await _safe_reply(update, summary, reply_markup=keyboard, parse_mode="HTML")
@@ -847,11 +879,23 @@ async def confirm_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
 
+    if text == "✏️ Исправить":
+        # Возврат к шагу NAME с сохранёнными данными
+        await _safe_reply(
+            update,
+            "✏️ <b>Шаг 1/7:</b> Введите наименование товара/услуги "
+            f"(текущее: <code>{escape(context.user_data.get('name', ''))}</code>):",
+            reply_markup=CANCEL_KEYBOARD,
+            parse_mode="HTML",
+        )
+        return NAME
+
     if text not in ("✅ Подтвердить", "🔄 Повторить"):
         await _safe_reply(
             update,
             "⚠️ Используйте кнопки:\n"
             "✅ Подтвердить — сохранить заявку\n"
+            "✏️ Исправить — изменить данные\n"
             "❌ Отмена — отменить",
         )
         return CONFIRM
@@ -909,6 +953,16 @@ async def confirm_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
             admin_notification += f"📝 {escape(context.user_data['notes'])}\n"
         if photos:
             admin_notification += f"📎 Фото: {len(photos)} шт.\n"
+        notify_markup = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        f"📋 Открыть заявку #{request_id}",
+                        callback_data=f"detail:{request_id}",
+                    )
+                ]
+            ]
+        )
         try:
             await _safe_send(
                 context,
@@ -916,6 +970,7 @@ async def confirm_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 admin_notification,
                 parse_mode="HTML",
                 disable_web_page_preview=True,
+                reply_markup=notify_markup,
             )
         except Exception as e:
             logger.warning(f"Не удалось отправить уведомление о новой заявке: {e}")
@@ -1301,7 +1356,18 @@ async def complete_confirm_handler(update: Update, context: ContextTypes.DEFAULT
     if comment:
         notification += f"\n💬 Комментарий: {escape(comment)}"
 
-    await _safe_edit(query, notification, parse_mode="HTML")
+    notify_markup = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    f"📋 Открыть заявку #{r['id']}",
+                    callback_data=f"detail:{r['id']}",
+                )
+            ]
+        ]
+    )
+
+    await _safe_edit(query, notification, parse_mode="HTML", reply_markup=notify_markup)
 
     # Уведомление в общий чат
     try:
@@ -1311,6 +1377,7 @@ async def complete_confirm_handler(update: Update, context: ContextTypes.DEFAULT
             notification,
             parse_mode="HTML",
             disable_web_page_preview=True,
+            reply_markup=notify_markup,
         )
     except Exception as e:
         logger.warning(f"Не удалось отправить уведомление в чат: {e}")
@@ -1327,6 +1394,7 @@ async def complete_confirm_handler(update: Update, context: ContextTypes.DEFAULT
                     notification,
                     parse_mode="HTML",
                     disable_web_page_preview=True,
+                    reply_markup=notify_markup,
                 )
             except Exception as e:
                 logger.warning(
@@ -2141,6 +2209,485 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+# ===== ДАШБОРД =====
+async def dashboard_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает дашборд администратору."""
+    if not is_admin(update.effective_user.id):
+        await _safe_reply(update, "⛔ У вас нет прав для этой команды.")
+        return
+    text = build_dashboard()
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("📋 Все заявки", callback_data="reqs:all:0"),
+                InlineKeyboardButton("📊 Отчёт", callback_data="report:active"),
+            ]
+        ]
+    )
+    await _safe_reply(update, text, parse_mode="HTML", reply_markup=keyboard)
+
+
+# ===== РАЗДЕЛ «ЗАЯВКИ» =====
+async def requests_list_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает список заявок с фильтрами."""
+    if not is_admin(update.effective_user.id):
+        await _safe_reply(update, "⛔ Нет доступа.")
+        return ConversationHandler.END
+    context.user_data["req_filter"] = None
+    return await _show_requests_list(update, context, 0)
+
+
+async def _show_requests_list(update_or_query, context, page: int):
+    """Показывает страницу списка заявок с фильтрацией по статусу."""
+    status_filter = context.user_data.get("req_filter")
+    requests = get_requests_by_status(status=status_filter, limit=200)
+
+    PAGE_SIZE = 8
+    total_pages = max(1, (len(requests) + PAGE_SIZE - 1) // PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * PAGE_SIZE
+    end = start + PAGE_SIZE
+    page_requests = requests[start:end]
+
+    # Кнопки фильтров
+    filter_buttons = [
+        [
+            InlineKeyboardButton(
+                "✅ Все" if not status_filter else "Все",
+                callback_data="reqf:none",
+            ),
+            InlineKeyboardButton(
+                "⚪ Новые" if status_filter == "new" else "⚪",
+                callback_data="reqf:new",
+            ),
+            InlineKeyboardButton(
+                "🟡 Заказ" if status_filter == "ordered" else "🟡",
+                callback_data="reqf:ordered",
+            ),
+            InlineKeyboardButton(
+                "🔵 Достав" if status_filter == "delivered" else "🔵",
+                callback_data="reqf:delivered",
+            ),
+            InlineKeyboardButton(
+                "🟢 Сделано" if status_filter == "done" else "🟢",
+                callback_data="reqf:done",
+            ),
+        ]
+    ]
+
+    # Список заявок
+    keyboard = []
+    for r in page_requests:
+        status_emoji = _status_emoji(r.get("status", "new"))
+        name = r["name"][:20]
+        obj = r.get("object", "—")[:10]
+        label = f"{status_emoji} #{r['id']} {name} ({obj})"
+        keyboard.append([InlineKeyboardButton(label, callback_data=f"rc:{r['id']}")])
+
+    # Пагинация
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️ Назад", callback_data=f"reqp:{page - 1}"))
+    nav.append(
+        InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="reqnoop")
+    )
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton("Вперёд ➡️", callback_data=f"reqp:{page + 1}"))
+    if nav:
+        keyboard.append(nav)
+
+    all_buttons = filter_buttons + keyboard
+    markup = InlineKeyboardMarkup(all_buttons) if all_buttons else None
+
+    status_text = (
+        f" ({STATUS_LABELS.get(status_filter, 'Все')})" if status_filter else ""
+    )
+    text = (
+        f"📋 <b>Заявки{status_text}</b>\n"
+        f"Всего: {len(requests)}\n\n"
+        "Выберите заявку:"
+    )
+
+    if hasattr(update_or_query, "callback_query") and update_or_query.callback_query:
+        await _safe_edit(
+            update_or_query.callback_query,
+            text,
+            reply_markup=markup,
+            parse_mode="HTML",
+        )
+    elif hasattr(update_or_query, "message"):
+        await _safe_reply(update_or_query, text, reply_markup=markup, parse_mode="HTML")
+    return REQUESTS_LIST
+
+
+def _status_emoji(status: str) -> str:
+    """Возвращает эмодзи для статуса."""
+    return {
+        "new": "⚪",
+        "ordered": "🟡",
+        "delivered": "🔵",
+        "done": "🟢",
+        "archived": "📦",
+    }.get(status, "⚪")
+
+
+async def requests_filter_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает фильтр по статусу."""
+    query = update.callback_query
+    await query.answer()
+    filter_val = query.data.split(":")[1]
+    context.user_data["req_filter"] = None if filter_val == "none" else filter_val
+    return await _show_requests_list(update, context, 0)
+
+
+async def requests_page_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Пагинация списка заявок."""
+    query = update.callback_query
+    await query.answer()
+    page = int(query.data.split(":")[1])
+    return await _show_requests_list(update, context, page)
+
+
+async def requests_card_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает карточку заявки с действиями."""
+    query = update.callback_query
+    await query.answer()
+    req_id = int(query.data.split(":")[1])
+
+    req = get_request_by_id(req_id)
+    if not req:
+        await _safe_edit(query, "⚠️ Заявка не найдена.")
+        return REQUESTS_LIST
+
+    context.user_data["card_request"] = req
+    return await _render_request_card(query, context, req)
+
+
+async def _render_request_card(query, context, req: dict):
+    """Рендерит карточку заявки с inline-кнопками."""
+    req_id = req["id"]
+    qty_text = f"{req.get('quantity', '—')} {req.get('unit', '')}".strip()
+    status_label = STATUS_LABELS.get(req.get("status", "new"), req.get("status", "—"))
+    status_emoji = _status_emoji(req.get("status", "new"))
+    notes = req.get("notes", "")
+    photos = get_request_photos(req_id)
+    photo_text = f"\n📎 Фото: {len(photos)} шт." if photos else ""
+
+    text = (
+        f"📋 <b>Заявка #{req_id}</b>\n\n"
+        f"📦 Наименование: <b>{escape(req.get('name', '—'))}</b>\n"
+        f"🔢 Количество: <code>{escape(qty_text)}</code>\n"
+        f"👤 Инициатор: {escape(req.get('initiator', '—'))}\n"
+        f"🏗️ Объект: {escape(req.get('object', '—'))}\n"
+        f"📊 Статус: {status_emoji} {status_label}\n"
+        f"📅 Дата: {escape(req.get('request_date', '—'))}"
+    )
+    if req.get("done_date"):
+        text += f"\n📅 Выполнено: {escape(req['done_date'])}"
+    if notes and notes != "-":
+        text += f"\n📝 Примечание: {escape(notes)}"
+    if photo_text:
+        text += photo_text
+
+    buttons = []
+    # Кнопки действий
+    buttons.append(
+        [
+            InlineKeyboardButton("🔄 Статус", callback_data=f"reqst:{req_id}"),
+            InlineKeyboardButton(
+                f"📷 Фото ({len(photos)})" if photos else "📷 Фото",
+                callback_data=f"photos:{req_id}",
+            ),
+        ]
+    )
+    buttons.append(
+        [
+            InlineKeyboardButton("✏️ Редактировать", callback_data=f"reqe:{req_id}"),
+            InlineKeyboardButton("🗑 Удалить", callback_data=f"reqdel:{req_id}"),
+        ]
+    )
+    buttons.append(
+        [
+            InlineKeyboardButton("⬅️ Назад к списку", callback_data="reqback"),
+        ]
+    )
+
+    await _safe_edit(
+        query, text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML"
+    )
+    return REQUESTS_CARD
+
+
+async def requests_card_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает действия в карточке заявки."""
+    query = update.callback_query
+    data = query.data
+    user_id = update.effective_user.id
+
+    if data == "reqback":
+        await query.answer()
+        return await _show_requests_list(update, context, 0)
+
+    if data.startswith("reqst:"):
+        # Смена статуса — перенаправляем в status flow
+        await query.answer()
+        req_id = int(data.split(":")[1])
+        req = get_request_by_id(req_id)
+        if not req:
+            await _safe_edit(query, "⚠️ Заявка не найдена.")
+            return ConversationHandler.END
+        context.user_data["status_request"] = req
+        current = req.get("status", "new")
+        current_label = STATUS_LABELS.get(current, current)
+        keyboard = []
+        for st_key, st_label in STATUS_LABELS.items():
+            if st_key == "done" or st_key == "archived":
+                continue
+            if st_key == current:
+                continue
+            keyboard.append(
+                [InlineKeyboardButton(st_label, callback_data=f"reqssc:{st_key}")]
+            )
+        keyboard.append(
+            [InlineKeyboardButton("❌ Отмена", callback_data="reqsscancel")]
+        )
+        await _safe_edit(
+            query,
+            f"🔄 <b>Заявка #{req_id}</b>\n"
+            f"📦 {escape(req['name'])}\n"
+            f"Текущий статус: {current_label}\n\n"
+            "Выберите новый статус:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="HTML",
+        )
+        return REQUESTS_CARD
+
+    if data.startswith("reqssc:"):
+        # Подтверждение смены статуса
+        await query.answer()
+        new_status = data.split(":")[1]
+        req = context.user_data.get("status_request")
+        if not req:
+            await _safe_edit(query, "⚠️ Данные не найдены.")
+            return ConversationHandler.END
+        success = update_request_status(
+            req["id"],
+            new_status,
+            user_id=user_id,
+            user_name=_user_name(update),
+        )
+        if success:
+            new_label = STATUS_LABELS.get(new_status, new_status)
+            await _safe_edit(
+                query,
+                f"✅ Заявка #{req['id']} → <b>{new_label}</b>",
+                parse_mode="HTML",
+            )
+        else:
+            await _safe_edit(query, "❌ Не удалось изменить статус.")
+        context.user_data.pop("status_request", None)
+        return ConversationHandler.END
+
+    if data == "reqsscancel":
+        await query.answer()
+        context.user_data.pop("status_request", None)
+        req = context.user_data.get("card_request")
+        if req:
+            return await _render_request_card(query, context, req)
+        await _safe_edit(query, "❌ Отменено.")
+        return ConversationHandler.END
+
+    if data.startswith("reqe:"):
+        # Редактирование — переход к выбору поля
+        await query.answer()
+        req_id = int(data.split(":")[1])
+        req = get_request_by_id(req_id)
+        if not req:
+            await _safe_edit(query, "⚠️ Заявка не найдена.")
+            return ConversationHandler.END
+        context.user_data["edit_request"] = req
+        keyboard = [
+            [InlineKeyboardButton("📦 Наименование", callback_data="editf:name")],
+            [InlineKeyboardButton("🔢 Количество", callback_data="editf:quantity")],
+            [InlineKeyboardButton("📏 Единица", callback_data="editf:unit")],
+            [InlineKeyboardButton("🏗️ Объект", callback_data="editf:object")],
+            [InlineKeyboardButton("📝 Примечание", callback_data="editf:notes")],
+            [InlineKeyboardButton("❌ Отмена", callback_data="editcancel")],
+        ]
+        await _safe_edit(
+            query,
+            f"✏️ <b>Редактирование заявки #{req_id}</b>\n\n"
+            f"📦 {escape(req.get('name', '—'))}\n"
+            f"🔢 {req.get('quantity', '—')} {req.get('unit', '')}\n"
+            f"🏗️ {escape(req.get('object', '—'))}\n"
+            f"📝 {escape(req.get('notes', '—'))}\n\n"
+            "Выберите поле для редактирования:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="HTML",
+        )
+        return REQUESTS_CARD
+
+    if data.startswith("editf:"):
+        # Выбор поля → запрос нового значения
+        await query.answer()
+        field = data.split(":")[1]
+        context.user_data["edit_field"] = field
+        field_names = {
+            "name": "наименование",
+            "quantity": "количество",
+            "unit": "единица измерения",
+            "object": "объект",
+            "notes": "примечание",
+        }
+        field_name = field_names.get(field, field)
+        await _safe_edit(
+            query,
+            f"✏️ Введите новое значение для <b>{field_name}</b>:",
+            parse_mode="HTML",
+        )
+        return EDIT_INPUT_VALUE
+
+    if data == "editcancel":
+        await query.answer()
+        context.user_data.pop("edit_request", None)
+        context.user_data.pop("edit_field", None)
+        req = context.user_data.get("card_request")
+        if req:
+            return await _render_request_card(query, context, req)
+        await _safe_edit(query, "❌ Отменено.")
+        return ConversationHandler.END
+
+    if data.startswith("reqdel:"):
+        # Удаление — запрос подтверждения
+        await query.answer()
+        req_id = int(data.split(":")[1])
+        req = get_request_by_id(req_id)
+        if not req:
+            await _safe_edit(query, "⚠️ Заявка не найдена.")
+            return ConversationHandler.END
+        context.user_data["delete_request"] = req
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    "✅ Да, удалить", callback_data=f"reqdelyes:{req_id}"
+                ),
+                InlineKeyboardButton("❌ Нет", callback_data="reqdelno"),
+            ]
+        ]
+        await _safe_edit(
+            query,
+            f"🗑 <b>Удалить заявку #{req_id}?</b>\n\n"
+            f"📦 {escape(req.get('name', '—'))}\n"
+            f"👤 {escape(req.get('initiator', '—'))}\n\n"
+            "Это действие нельзя отменить.",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="HTML",
+        )
+        return REQUESTS_CARD
+
+    if data.startswith("reqdelyes:"):
+        # Подтверждение удаления
+        await query.answer()
+        req_id = int(data.split(":")[1])
+        success = delete_request(
+            req_id,
+            user_id=user_id,
+            user_name=_user_name(update),
+        )
+        if success:
+            await _safe_edit(query, f"✅ Заявка #{req_id} удалена.", parse_mode="HTML")
+        else:
+            await _safe_edit(query, "❌ Не удалось удалить заявку.")
+        context.user_data.pop("delete_request", None)
+        context.user_data.pop("card_request", None)
+        return ConversationHandler.END
+
+    if data == "reqdelno":
+        await query.answer()
+        context.user_data.pop("delete_request", None)
+        req = context.user_data.get("card_request")
+        if req:
+            return await _render_request_card(query, context, req)
+        await _safe_edit(query, "❌ Удаление отменено.")
+        return ConversationHandler.END
+
+    return REQUESTS_CARD
+
+
+async def edit_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Принимает новое значение поля при редактировании."""
+    user_id = update.effective_user.id
+    new_value = update.message.text.strip()
+    req = context.user_data.get("edit_request")
+    field = context.user_data.pop("edit_field", None)
+
+    if not req or not field:
+        await _safe_reply(update, "⚠️ Ошибка: данные не найдены.")
+        return ConversationHandler.END
+
+    if new_value == "❌ Отмена":
+        context.user_data.pop("edit_request", None)
+        await _safe_reply(
+            update,
+            "❌ Редактирование отменено.",
+            reply_markup=get_main_keyboard(user_id),
+        )
+        return ConversationHandler.END
+
+    new_value = truncate_field(new_value, MAX_FIELD_LENGTH)
+
+    # Валидация количества
+    if field == "quantity":
+        if not validate_quantity(new_value):
+            await _safe_reply(update, "❌ Введите число (например, 10 или 5.5):")
+            return EDIT_INPUT_VALUE
+        new_value = float(new_value.replace(",", "."))
+
+    kwargs = {f"{'object_name' if field == 'object' else field}": new_value}
+    success = edit_request(
+        req["id"],
+        user_id=user_id,
+        user_name=_user_name(update),
+        **kwargs,
+    )
+
+    if success:
+        field_names = {
+            "name": "Наименование",
+            "quantity": "Количество",
+            "unit": "Единица",
+            "object": "Объект",
+            "notes": "Примечание",
+        }
+        await _safe_reply(
+            update,
+            f"✅ {field_names.get(field, field)} обновлено: <b>{escape(str(new_value))}</b>",
+            reply_markup=get_main_keyboard(user_id),
+            parse_mode="HTML",
+        )
+    else:
+        await _safe_reply(
+            update, "❌ Не удалось обновить.", reply_markup=get_main_keyboard(user_id)
+        )
+
+    context.user_data.pop("edit_request", None)
+    return ConversationHandler.END
+
+
+async def requests_back_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Возврат к списку заявок из карточки."""
+    query = update.callback_query
+    await query.answer()
+    return await _show_requests_list(update, context, 0)
+
+
+async def requests_noop_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Noop для пагинации."""
+    query = update.callback_query
+    await query.answer()
+    return REQUESTS_LIST
+
+
 # ===== ОБЩИЙ ОБРАБОТЧИК ОШИБОК =====
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     """Глобальный обработчик ошибок."""
@@ -2330,6 +2877,33 @@ def main():
         ],
     )
 
+    requests_handler = ConversationHandler(
+        entry_points=[
+            MessageHandler(filters.Regex("^📋 Заявки$"), requests_list_start)
+        ],
+        states={
+            REQUESTS_LIST: [
+                CallbackQueryHandler(requests_filter_handler, pattern=r"^reqf:.+$"),
+                CallbackQueryHandler(requests_page_handler, pattern=r"^reqp:\d+$"),
+                CallbackQueryHandler(requests_card_show, pattern=r"^rc:\d+$"),
+                CallbackQueryHandler(requests_noop_handler, pattern=r"^reqnoop$"),
+            ],
+            REQUESTS_CARD: [
+                CallbackQueryHandler(
+                    requests_card_handler,
+                    pattern=r"^(reqst|reqssc|reqsscancel|reqe|editf|editcancel|reqdel|reqdelyes|reqdelno|reqback):?.*$",
+                ),
+            ],
+            EDIT_INPUT_VALUE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_input_handler)
+            ],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            MessageHandler(filters.Regex("^❌ Отмена$"), cancel),
+        ],
+    )
+
     register_conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
@@ -2342,6 +2916,7 @@ def main():
 
     app.add_handler(register_conv)
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(requests_handler)
     app.add_handler(analysis_handler)
     app.add_handler(complete_handler)
     app.add_handler(status_handler)
@@ -2350,6 +2925,7 @@ def main():
     app.add_handler(conv_handler)
     app.add_handler(CallbackQueryHandler(show_request_photos, pattern=r"^photos:\d+$"))
     app.add_handler(CallbackQueryHandler(show_request_details, pattern=r"^detail:\d+$"))
+    app.add_handler(MessageHandler(filters.Regex("^📊 Дашборд$"), dashboard_start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu))
 
     app.job_queue.run_daily(

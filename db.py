@@ -90,12 +90,13 @@ _DEFAULT_LISTS = {
 }
 
 # Допустимые статусы заявок
-VALID_STATUSES = ("new", "ordered", "delivered", "done")
+VALID_STATUSES = ("new", "ordered", "delivered", "done", "archived")
 STATUS_LABELS = {
     "new": "Новая",
     "ordered": "Заказана",
     "delivered": "Доставлена",
     "done": "Выполнена",
+    "archived": "Архив",
 }
 
 
@@ -143,6 +144,19 @@ def init_db():
         if not _column_exists(conn, "requests", "status"):
             conn.execute("ALTER TABLE requests ADD COLUMN status TEXT DEFAULT 'new'")
             logger.info("Миграция: добавлена колонка status в requests")
+
+        # Миграция: UNIQUE на telegram_id в initiator_users
+        try:
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_initiator_tg_id "
+                "ON initiator_users(telegram_id)"
+            )
+        except sqlite3.IntegrityError:
+            # Если уже есть дубли — логируем, но не крашим
+            logger.warning(
+                "Не удалось создать UNIQUE INDEX на telegram_id — "
+                "возможно, есть дубли в initiator_users"
+            )
 
         # Заполняем справочники ТОЛЬКО если таблица пустая
         for list_type, values in _DEFAULT_LISTS.items():
@@ -376,7 +390,8 @@ def update_request_status(
     user_id: Optional[int] = None,
     user_name: str = "",
 ) -> bool:
-    """Обновляет статус заявки. Возвращает True если успешно."""
+    """Обновляет статус заявки. Возвращает True если успешно.
+    Использует optimistic locking: UPDATE ... WHERE id=? для атомарности."""
     if new_status not in VALID_STATUSES:
         logger.warning(f"Недопустимый статус: {new_status}")
         return False
@@ -389,10 +404,12 @@ def update_request_status(
         old_status = row["status"]
         if old_status == new_status:
             return True
-        conn.execute(
+        cursor = conn.execute(
             "UPDATE requests SET status = ? WHERE id = ?",
             (new_status, request_id),
         )
+        if cursor.rowcount == 0:
+            return False
     audit_log(
         request_id,
         user_id,
@@ -468,24 +485,94 @@ def clear_all_requests():
     return count
 
 
+def delete_request(
+    request_id: int,
+    user_id: Optional[int] = None,
+    user_name: str = "",
+) -> bool:
+    """Удаляет заявку и связанные фото. Возвращает True если успешно."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT id FROM requests WHERE id = ?", (request_id,)
+        ).fetchone()
+        if not row:
+            return False
+        conn.execute("DELETE FROM request_photos WHERE request_id = ?", (request_id,))
+        conn.execute("DELETE FROM requests WHERE id = ?", (request_id,))
+    audit_log(request_id, user_id, user_name, "deleted", "")
+    logger.info(f"Заявка #{request_id} удалена")
+    return True
+
+
+def get_requests_by_status(status: Optional[str] = None, limit: int = 50) -> List[dict]:
+    """Возвращает заявки по статусу. Если status=None — все неархивные."""
+    with get_conn() as conn:
+        if status:
+            rows = conn.execute(
+                """SELECT id, name, quantity, unit, request_date, done_date,
+                          initiator, status, object, notes
+                   FROM requests
+                   WHERE status = ?
+                   ORDER BY request_date DESC LIMIT ?""",
+                (status, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT id, name, quantity, unit, request_date, done_date,
+                          initiator, status, object, notes
+                   FROM requests
+                   WHERE status != 'archived'
+                   ORDER BY request_date DESC LIMIT ?""",
+                (limit,),
+            ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_dashboard_counts() -> dict:
+    """Возвращает счётчики для дашборда."""
+    with get_conn() as conn:
+        total_active = conn.execute(
+            "SELECT COUNT(*) FROM requests WHERE done_date IS NULL AND status != 'archived'"
+        ).fetchone()[0]
+        by_status = {}
+        for st in ("new", "ordered", "delivered"):
+            count = conn.execute(
+                "SELECT COUNT(*) FROM requests WHERE status = ?", (st,)
+            ).fetchone()[0]
+            by_status[st] = count
+        overdue = conn.execute("""SELECT COUNT(*) FROM requests
+               WHERE done_date IS NULL AND status != 'archived'
+               AND status NOT IN ('done', 'delivered')
+               AND request_date < date('now', '-' || (
+                   SELECT COALESCE(value, '3') FROM settings WHERE key = 'overdue_days'
+               ) || ' days')""").fetchone()[0]
+        today_str = date.today().isoformat()
+        done_today = conn.execute(
+            "SELECT COUNT(*) FROM requests WHERE done_date = ?", (today_str,)
+        ).fetchone()[0]
+    return {
+        "total_active": total_active,
+        "new": by_status.get("new", 0),
+        "ordered": by_status.get("ordered", 0),
+        "delivered": by_status.get("delivered", 0),
+        "overdue": overdue,
+        "done_today": done_today,
+    }
+
+
 def archive_completed_requests(days_old: int = 90) -> int:
     """Архивирует заявки старше указанного количества дней (помечает status='archived').
     Возвращает количество архивированных заявок."""
-    cutoff = date.today().toordinal() - days_old
+    cutoff = date.today().isoformat()
     with get_conn() as conn:
-        rows = conn.execute(
-            """SELECT id FROM requests
+        cursor = conn.execute(
+            """UPDATE requests SET status = 'archived'
                WHERE done_date IS NOT NULL
                AND status = 'done'
-               AND julianday(done_date) < julianday(?, 'unixepoch')""",
-            (cutoff,),
-        ).fetchall()
-        for row in rows:
-            conn.execute(
-                "UPDATE requests SET status = 'archived' WHERE id = ?",
-                (row["id"],),
-            )
-    count = len(rows)
+               AND done_date < date(?, '-' || ? || ' days')""",
+            (cutoff, days_old),
+        )
+        count = cursor.rowcount
     if count:
         logger.info(f"Архивировано {count} заявок старше {days_old} дней")
         audit_log(None, None, "system", "archived", f"Архивировано: {count}")
@@ -632,19 +719,20 @@ def complete_requests_batch(
     user_id: Optional[int] = None,
     user_name: str = "",
 ) -> int:
-    """Завершает несколько заявок. Возвращает количество завершённых."""
-    completed = 0
+    """Завершает несколько заявок одним SQL. Возвращает количество завершённых.
+    Атомарно: UPDATE ... WHERE id IN (...) AND done_date IS NULL."""
+    if not request_ids:
+        return 0
+    placeholders = ",".join("?" * len(request_ids))
+    done_str = done_date.isoformat()
     with get_conn() as conn:
-        for req_id in request_ids:
-            row = conn.execute(
-                "SELECT done_date FROM requests WHERE id = ?", (req_id,)
-            ).fetchone()
-            if row and not row["done_date"]:
-                conn.execute(
-                    "UPDATE requests SET done_date = ?, status = 'done' WHERE id = ?",
-                    (done_date.isoformat(), req_id),
-                )
-                completed += 1
+        cursor = conn.execute(
+            f"""UPDATE requests
+                SET done_date = ?, status = 'done'
+                WHERE id IN ({placeholders}) AND done_date IS NULL""",
+            [done_str] + list(request_ids),
+        )
+        completed = cursor.rowcount
     if completed:
         audit_log(
             None,
@@ -678,6 +766,27 @@ def get_request_by_id(request_id: int) -> Optional[dict]:
             "SELECT * FROM requests WHERE id = ?", (request_id,)
         ).fetchone()
     return dict(row) if row else None
+
+
+def is_request_owner(request_id: int, telegram_id: int) -> bool:
+    """Проверяет, является ли пользователь инициатором заявки."""
+    try:
+        with get_conn() as conn:
+            # Получаем инициатора заявки
+            req = conn.execute(
+                "SELECT initiator FROM requests WHERE id = ?", (request_id,)
+            ).fetchone()
+            if not req or not req["initiator"]:
+                return False
+            # Проверяем, привязан ли telegram_id к этому инициатору
+            link = conn.execute(
+                "SELECT 1 FROM initiator_users WHERE initiator_name = ? AND telegram_id = ?",
+                (req["initiator"], telegram_id),
+            ).fetchone()
+            return link is not None
+    except Exception as e:
+        logger.warning(f"is_request_owner({request_id}, {telegram_id}) ошибка: {e}")
+        return False
 
 
 def get_user_requests(
