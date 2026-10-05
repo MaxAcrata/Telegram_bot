@@ -114,19 +114,19 @@ def format_task_html(task: dict, today: date, photo_count: int = 0) -> str:
 
 def build_report(save_to_file: bool = True, mode: str = "active") -> tuple:
     """Генерирует HTML-отчёт. mode: 'active' или 'completed'.
-    Возвращает (text, ids_with_photos) — текст отчёта и список ID заявок с фото."""
+    Возвращает (text, ids_with_photos, all_request_ids)."""
     today = date.today()
 
     if mode == "completed":
-        text, ids = _build_completed_report(today, save_to_file)
+        text, ids, all_ids = _build_completed_report(today, save_to_file)
     else:
-        text, ids = _build_active_report(today, save_to_file)
+        text, ids, all_ids = _build_active_report(today, save_to_file)
 
-    return text, ids
+    return text, ids, all_ids
 
 
 def _build_completed_report(today: date, save_to_file: bool) -> tuple:
-    """Отчёт по выполненным заявкам. Возвращает (text, ids_with_photos)."""
+    """Отчёт по выполненным заявкам. Возвращает (text, ids_with_photos, all_ids)."""
     tasks = get_completed_requests()
 
     report = [
@@ -141,12 +141,13 @@ def _build_completed_report(today: date, save_to_file: bool) -> tuple:
         result = "\n".join(report)
         if save_to_file:
             _save_report(result)
-        return result, []
+        return result, [], []
 
     # Получаем количество фото для всех заявок
     task_ids = [t["id"] for t in tasks]
     photo_counts = get_photo_counts(task_ids)
     ids_with_photos = [rid for rid, cnt in photo_counts.items() if cnt > 0]
+    all_ids = [t["id"] for t in tasks]
 
     for task in tasks:
         name = escape(task.get("name", "—"))
@@ -182,11 +183,11 @@ def _build_completed_report(today: date, save_to_file: bool) -> tuple:
     result = "\n".join(report)
     if save_to_file:
         _save_report(result)
-    return result, ids_with_photos
+    return result, ids_with_photos, all_ids
 
 
 def _build_active_report(today: date, save_to_file: bool) -> tuple:
-    """Отчёт по активным заявкам. Возвращает (text, ids_with_photos)."""
+    """Отчёт по активным заявкам. Возвращает (text, ids_with_photos, all_ids)."""
     active_tasks = get_active_requests()
 
     report = [
@@ -201,7 +202,7 @@ def _build_active_report(today: date, save_to_file: bool) -> tuple:
         result = "\n".join(report)
         if save_to_file:
             _save_report(result)
-        return result, []
+        return result, [], []
 
     # Статистика по явным статусам
     by_status = {}
@@ -228,6 +229,7 @@ def _build_active_report(today: date, save_to_file: bool) -> tuple:
     task_ids = [t["id"] for t in active_tasks]
     photo_counts = get_photo_counts(task_ids)
     ids_with_photos = [rid for rid, cnt in photo_counts.items() if cnt > 0]
+    all_ids = [t["id"] for t in active_tasks]
 
     # Группировка по объектам
     from itertools import groupby
@@ -277,7 +279,7 @@ def _build_active_report(today: date, save_to_file: bool) -> tuple:
     if save_to_file:
         _save_report(result)
     logger.info("Отчёт сформирован")
-    return result, ids_with_photos
+    return result, ids_with_photos, all_ids
 
 
 def _save_report(text: str):

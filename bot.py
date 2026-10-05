@@ -92,7 +92,7 @@ rate_limiter = RateLimiter(
 ) = range(10)
 
 # ===== СОСТОЯНИЯ ЗАВЕРШЕНИЯ ЗАЯВКИ =====
-COMPLETE_SELECT, COMPLETE_CONFIRM = range(50, 52)
+COMPLETE_SELECT, COMPLETE_COMMENT, COMPLETE_CONFIRM = range(50, 53)
 
 # ===== СОСТОЯНИЕ РЕГИСТРАЦИИ ИНИЦИАТОРА =====
 REG_NAME = 90
@@ -220,20 +220,34 @@ def _truncate_callback_data(prefix: str, value: str, max_bytes: int = 64) -> str
     return result
 
 
-def _build_photo_keyboard(ids_with_photos: list) -> InlineKeyboardMarkup:
-    """Создаёт inline-клавиатуру с кнопками просмотра фото."""
-    if not ids_with_photos:
-        return None
+def _build_photo_keyboard(
+    ids_with_photos: list, all_ids: list = None
+) -> InlineKeyboardMarkup:
+    """Создаёт inline-клавиатуру с кнопками деталей и просмотра фото."""
     buttons = []
-    for rid in ids_with_photos:
-        buttons.append(
-            [
-                InlineKeyboardButton(
-                    f"📎 Фото к заявке #{rid}", callback_data=f"photos:{rid}"
-                )
-            ]
-        )
-    return InlineKeyboardMarkup(buttons)
+    # Кнопки деталей для всех заявок
+    if all_ids:
+        for rid in all_ids:
+            has_photo = "📎" if rid in (ids_with_photos or []) else ""
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        f"📋 #{rid} Детали {has_photo}".strip(),
+                        callback_data=f"detail:{rid}",
+                    )
+                ]
+            )
+    elif ids_with_photos:
+        # Только фото (обратная совместимость)
+        for rid in ids_with_photos:
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        f"📎 Фото к заявке #{rid}", callback_data=f"photos:{rid}"
+                    )
+                ]
+            )
+    return InlineKeyboardMarkup(buttons) if buttons else None
 
 
 def _build_pagination_keyboard(
@@ -301,6 +315,60 @@ async def show_request_photos(update: Update, context: ContextTypes.DEFAULT_TYPE
         except Exception as e:
             logger.warning(f"Не удалось отправить фото {file_id}: {e}")
             await _safe_reply(update, "⚠️ Не удалось отправить одно из фото.")
+
+
+async def show_request_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает детали заявки по нажатию inline-кнопки из отчёта"""
+    query = update.callback_query
+    await query.answer()
+
+    req_id = int(query.data.split(":")[1])
+    req = get_request_by_id(req_id)
+
+    if not req:
+        await _safe_send(context, query.message.chat_id, "⚠️ Заявка не найдена.")
+        return
+
+    qty_text = f"{req.get('quantity', '—')} {req.get('unit', '')}".strip()
+    status_label = STATUS_LABELS.get(req.get("status", "new"), req.get("status", "—"))
+    notes = req.get("notes", "")
+    photos = get_request_photos(req_id)
+    photo_text = f"\n📎 Фото: {len(photos)} шт." if photos else ""
+
+    text = (
+        f"📋 <b>Заявка #{req['id']}</b>\n\n"
+        f"📦 Наименование: <b>{escape(req.get('name', '—'))}</b>\n"
+        f"🔢 Количество: <code>{escape(qty_text)}</code>\n"
+        f"👤 Инициатор: {escape(req.get('initiator', '—'))}\n"
+        f"🏗️ Объект: {escape(req.get('object', '—'))}\n"
+        f"📊 Статус: {status_label}\n"
+        f"📅 Дата: {escape(req.get('request_date', '—'))}"
+    )
+    if notes and notes != "-":
+        text += f"\n📝 Примечание: {escape(notes)}"
+    if photo_text:
+        text += photo_text
+
+    keyboard = None
+    if photos:
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        f"📎 Фото ({len(photos)})", callback_data=f"photos:{req_id}"
+                    )
+                ]
+            ]
+        )
+
+    await _safe_send(
+        context,
+        query.message.chat_id,
+        text,
+        parse_mode="HTML",
+        reply_markup=keyboard,
+        disable_web_page_preview=True,
+    )
 
 
 # ===== КОМАНДЫ =====
@@ -414,8 +482,8 @@ async def run_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _safe_reply(update, "⏳ Запускаю анализ...")
 
     try:
-        result, ids_with_photos = build_report(mode="active")
-        keyboard = _build_photo_keyboard(ids_with_photos)
+        result, ids_with_photos, all_ids = build_report(mode="active")
+        keyboard = _build_photo_keyboard(ids_with_photos, all_ids)
         await send_long_message(
             context,
             update.effective_chat.id,
@@ -442,7 +510,7 @@ async def scheduled_report(context: ContextTypes.DEFAULT_TYPE):
     context.bot_data[report_flag] = True
 
     try:
-        result, _ids = build_report()
+        result, _ids, _all = build_report()
         await send_long_message(context, chat_id, result, parse_mode="HTML")
     except Exception as e:
         logger.error(f"Ошибка автоотчёта: {e}", exc_info=True)
@@ -827,6 +895,31 @@ async def confirm_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _safe_reply(
             update, summary, reply_markup=get_main_keyboard(user_id), parse_mode="HTML"
         )
+
+        # Уведомление администраторам о новой заявке
+        admin_notification = (
+            "🆕 <b>Новая заявка</b>\n\n"
+            f"🆔 Номер: <b>#{request_id}</b>\n"
+            f"📦 {escape(context.user_data['name'])}\n"
+            f"🔢 {escape(context.user_data['quantity'])} {escape(context.user_data['unit'])}\n"
+            f"👤 {escape(context.user_data['initiator'])}\n"
+            f"🏗️ {escape(context.user_data['object'])}\n"
+        )
+        if context.user_data["notes"]:
+            admin_notification += f"📝 {escape(context.user_data['notes'])}\n"
+        if photos:
+            admin_notification += f"📎 Фото: {len(photos)} шт.\n"
+        try:
+            await _safe_send(
+                context,
+                int(TELEGRAM_CHAT_ID),
+                admin_notification,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+        except Exception as e:
+            logger.warning(f"Не удалось отправить уведомление о новой заявке: {e}")
+
         context.user_data.clear()
         clear_conversation_state(user_id)
 
@@ -899,8 +992,8 @@ async def analysis_filter_handler(update: Update, context: ContextTypes.DEFAULT_
     await _safe_edit(query, "⏳ Формирую отчёт...")
 
     try:
-        result, ids_with_photos = build_report(mode=mode)
-        keyboard = _build_photo_keyboard(ids_with_photos)
+        result, ids_with_photos, all_ids = build_report(mode=mode)
+        keyboard = _build_photo_keyboard(ids_with_photos, all_ids)
         await send_long_message(
             context,
             query.message.chat_id,
@@ -1037,7 +1130,7 @@ async def complete_batch_handler(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def complete_select_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает подтверждение завершения"""
+    """Показывает подтверждение завершения с возможностью добавить комментарий"""
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
     query = update.callback_query
@@ -1050,12 +1143,100 @@ async def complete_select_handler(update: Update, context: ContextTypes.DEFAULT_
         return ConversationHandler.END
 
     context.user_data["complete_request"] = selected
+    context.user_data["complete_comment"] = ""
     r = selected
     qty_text = f"{r['quantity']} {r['unit']}".strip() if r.get("quantity") else "—"
 
     text = (
         f"📋 <b>Заявка #{r['id']}</b>\n\n"
         f"📦 {escape(r['name'])}\n"
+        f"🔢 {escape(qty_text)}\n"
+        f"👤 {escape(r.get('initiator', '—'))}\n"
+        f"🏗️ {escape(r.get('object', '—'))}\n\n"
+        "Добавьте комментарий или пропустите:"
+    )
+    keyboard = [
+        [InlineKeyboardButton("➡️ Без комментария", callback_data="cr:nocomment")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="cr:cancel")],
+    ]
+    await _safe_edit(
+        query, text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML"
+    )
+    return COMPLETE_COMMENT
+
+
+async def complete_comment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает комментарий к завершению"""
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    query = update.callback_query
+    data = query.data
+
+    if data == "cr:cancel":
+        await query.answer()
+        context.user_data.pop("complete_request", None)
+        context.user_data.pop("complete_comment", None)
+        await _safe_edit(query, "❌ Отменено.")
+        return ConversationHandler.END
+
+    if data == "cr:nocomment":
+        await query.answer()
+        context.user_data["complete_comment"] = ""
+        return await _show_complete_final(query, context)
+
+    return COMPLETE_COMMENT
+
+
+async def complete_comment_text_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    """Принимает текст комментария от администратора"""
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    comment = update.message.text.strip()
+    if comment == "❌ Отмена":
+        context.user_data.pop("complete_request", None)
+        context.user_data.pop("complete_comment", None)
+        user_id = update.effective_user.id
+        await _safe_reply(
+            update, "❌ Отменено.", reply_markup=get_main_keyboard(user_id)
+        )
+        return ConversationHandler.END
+
+    context.user_data["complete_comment"] = truncate_field(comment, MAX_FIELD_LENGTH)
+
+    r = context.user_data.get("complete_request", {})
+    qty_text = f"{r.get('quantity', '—')} {r.get('unit', '')}".strip()
+
+    text = (
+        f"📋 <b>Заявка #{r.get('id', '?')}</b>\n\n"
+        f"📦 {escape(r.get('name', '—'))}\n"
+        f"🔢 {escape(qty_text)}\n"
+        f"👤 {escape(r.get('initiator', '—'))}\n"
+        f"🏗️ {escape(r.get('object', '—'))}\n"
+        f"💬 Комментарий: {escape(comment)}\n\n"
+        "Завершить?"
+    )
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Выполнено", callback_data="cr:confirm"),
+            InlineKeyboardButton("❌ Отмена", callback_data="cr:cancel"),
+        ],
+    ]
+    await _safe_reply(
+        update, text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML"
+    )
+    return COMPLETE_CONFIRM
+
+
+async def _show_complete_final(query, context):
+    """Показывает финальное подтверждение завершения (без комментария)"""
+    r = context.user_data.get("complete_request", {})
+    qty_text = f"{r.get('quantity', '—')} {r.get('unit', '')}".strip()
+
+    text = (
+        f"📋 <b>Заявка #{r.get('id', '?')}</b>\n\n"
+        f"📦 {escape(r.get('name', '—'))}\n"
         f"🔢 {escape(qty_text)}\n"
         f"👤 {escape(r.get('initiator', '—'))}\n"
         f"🏗️ {escape(r.get('object', '—'))}\n\n"
@@ -1074,7 +1255,7 @@ async def complete_select_handler(update: Update, context: ContextTypes.DEFAULT_
 
 
 async def complete_confirm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Завершает заявку и отправляет уведомление"""
+    """Завершает заявку и отправляет уведомление с комментарием"""
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
     query = update.callback_query
@@ -1083,6 +1264,7 @@ async def complete_confirm_handler(update: Update, context: ContextTypes.DEFAULT
 
     if data == "cr:cancel":
         context.user_data.pop("complete_request", None)
+        context.user_data.pop("complete_comment", None)
         await _safe_edit(query, "❌ Отменено.")
         return ConversationHandler.END
 
@@ -1090,6 +1272,8 @@ async def complete_confirm_handler(update: Update, context: ContextTypes.DEFAULT
     if not r:
         await _safe_edit(query, "⚠️ Данные не найдены.")
         return ConversationHandler.END
+
+    comment = context.user_data.get("complete_comment", "")
 
     today = date.today()
     result = complete_request(
@@ -1102,6 +1286,7 @@ async def complete_confirm_handler(update: Update, context: ContextTypes.DEFAULT
     if not result:
         await _safe_edit(query, "⚠️ Заявка не найдена.")
         context.user_data.pop("complete_request", None)
+        context.user_data.pop("complete_comment", None)
         return ConversationHandler.END
 
     qty_text = f"{r['quantity']} {r['unit']}".strip() if r.get("quantity") else "—"
@@ -1113,6 +1298,8 @@ async def complete_confirm_handler(update: Update, context: ContextTypes.DEFAULT
         f"🏗️ {escape(r.get('object', '—'))}\n"
         f"📅 Выполнено: {today.strftime('%d.%m')}"
     )
+    if comment:
+        notification += f"\n💬 Комментарий: {escape(comment)}"
 
     await _safe_edit(query, notification, parse_mode="HTML")
 
@@ -1147,6 +1334,7 @@ async def complete_confirm_handler(update: Update, context: ContextTypes.DEFAULT
                 )
 
     context.user_data.pop("complete_request", None)
+    context.user_data.pop("complete_comment", None)
     return ConversationHandler.END
 
 
@@ -2078,6 +2266,14 @@ def main():
                 CallbackQueryHandler(complete_batch_handler, pattern=r"^crb:\d+$"),
                 CallbackQueryHandler(complete_start, pattern=r"^crnoop$"),
             ],
+            COMPLETE_COMMENT: [
+                CallbackQueryHandler(
+                    complete_comment_handler, pattern=r"^cr:(nocomment|cancel)$"
+                ),
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND, complete_comment_text_handler
+                ),
+            ],
             COMPLETE_CONFIRM: [
                 CallbackQueryHandler(
                     complete_confirm_handler, pattern=r"^cr:(confirm|cancel)$"
@@ -2153,6 +2349,7 @@ def main():
     app.add_handler(admin_handler)
     app.add_handler(conv_handler)
     app.add_handler(CallbackQueryHandler(show_request_photos, pattern=r"^photos:\d+$"))
+    app.add_handler(CallbackQueryHandler(show_request_details, pattern=r"^detail:\d+$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu))
 
     app.job_queue.run_daily(
