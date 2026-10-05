@@ -1,11 +1,39 @@
 import logging
 import math
+import time
 from datetime import datetime
 from typing import Optional
+from collections import defaultdict
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
 )
+
+
+class RateLimiter:
+    """Скользящее окно rate limiting по user_id."""
+
+    def __init__(self, max_requests: int = 5, window_sec: int = 60):
+        self._max = max_requests
+        self._window = window_sec
+        self._timestamps: dict[int, list[float]] = defaultdict(list)
+
+    def is_allowed(self, user_id: int) -> bool:
+        """Проверяет, не превышен ли лимит. Возвращает True если действие разрешено."""
+        now = time.monotonic()
+        timestamps = self._timestamps[user_id]
+        # Удаляем устаревшие
+        self._timestamps[user_id] = [t for t in timestamps if now - t < self._window]
+        if len(self._timestamps[user_id]) >= self._max:
+            return False
+        self._timestamps[user_id].append(now)
+        return True
+
+    def remaining(self, user_id: int) -> int:
+        """Возвращает количество оставшихся действий."""
+        now = time.monotonic()
+        timestamps = [t for t in self._timestamps[user_id] if now - t < self._window]
+        return max(0, self._max - len(timestamps))
 
 
 def parse_date(value) -> Optional[datetime]:
@@ -46,6 +74,13 @@ def validate_quantity(value: str) -> bool:
         return False
 
 
+def truncate_field(value: str, max_length: int = 500) -> str:
+    """Обрезает поле до максимальной длины."""
+    if len(value) <= max_length:
+        return value
+    return value[:max_length]
+
+
 def split_message(text: str, max_length: int = 4000) -> list:
     """Разбивает длинное сообщение на части, не ломая HTML-теги и строки."""
     if len(text) <= max_length:
@@ -65,7 +100,6 @@ def split_message(text: str, max_length: int = 4000) -> list:
         part = text[:cut]
 
         # Закрываем незакрытые HTML-теги в этой части
-        # Храним (tag_name, full_opening_tag) для сохранения атрибутов
         open_tags = []
         i = 0
         while i < len(part):
