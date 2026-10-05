@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 from datetime import time, datetime, date
@@ -159,8 +160,6 @@ async def _safe_reply(update, text, **kwargs):
         return await update.message.reply_text(text, **kwargs)
     except RetryAfter as e:
         logger.warning(f"RetryAfter: ждём {e.retry_after} сек")
-        import asyncio
-
         await asyncio.sleep(e.retry_after)
         return await update.message.reply_text(text, **kwargs)
     except TelegramError as e:
@@ -173,8 +172,6 @@ async def _safe_send(context, chat_id, text, **kwargs):
         return await context.bot.send_message(chat_id=chat_id, text=text, **kwargs)
     except RetryAfter as e:
         logger.warning(f"RetryAfter: ждём {e.retry_after} сек")
-        import asyncio
-
         await asyncio.sleep(e.retry_after)
         return await context.bot.send_message(chat_id=chat_id, text=text, **kwargs)
     except TelegramError as e:
@@ -187,8 +184,6 @@ async def _safe_edit(query, text, **kwargs):
         return await query.edit_message_text(text, **kwargs)
     except RetryAfter as e:
         logger.warning(f"RetryAfter: ждём {e.retry_after} сек")
-        import asyncio
-
         await asyncio.sleep(e.retry_after)
         return await query.edit_message_text(text, **kwargs)
     except TelegramError as e:
@@ -294,8 +289,6 @@ async def show_request_photos(update: Update, context: ContextTypes.DEFAULT_TYPE
                 disable_notification=True,
             )
         except RetryAfter as e:
-            import asyncio
-
             await asyncio.sleep(e.retry_after)
             try:
                 await context.bot.send_photo(

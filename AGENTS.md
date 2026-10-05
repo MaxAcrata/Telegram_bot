@@ -10,24 +10,26 @@ Telegram bot for managing construction material requests. Data lives in a local 
 
 | File | Responsibility | Depends on |
 |---|---|---|
-| `bot.py` | Telegram handlers, ConversationHandlers, keyboards, scheduled report, admin panel, registration, notifications, photo handling | `core`, `db`, `utils`, `config` |
-| `config.py` | Loads `.env`, validates required vars at import time, defines constants | `dotenv` |
-| `core.py` | Report generation: HTML formatting, overdue analysis, active/completed modes, clickable links, photo count labels | `db`, `config` |
-| `db.py` | SQLite database: schema, CRUD for requests, lists, settings, initiator-user links, photo storage | `sqlite3`, `config` |
-| `utils.py` | Quantity validation (positive finite numbers only), HTML-safe message splitting with tag attribute preservation | (standalone) |
+| `bot.py` | Telegram handlers, ConversationHandlers, keyboards, scheduled report, admin panel, registration, notifications, photo handling, rate limiting, persistent drafts, my requests, search, pagination, batch complete | `core`, `db`, `utils`, `config` |
+| `config.py` | Loads `.env`, validates config at startup (ranges, paths, IDs), defines constants | `dotenv` |
+| `core.py` | Report generation: HTML formatting, explicit status labels, overdue analysis, active/completed modes, clickable links, photo count labels, request IDs | `db`, `config` |
+| `db.py` | SQLite database: schema, CRUD for requests, lists, settings, initiator-user links, photo storage, audit log, backup API, persistent conversation state | `sqlite3`, `config` |
+| `utils.py` | Quantity validation, field truncation, rate limiter, HTML-safe message splitting | (standalone) |
 
 Data flow: `bot.py` → `db.py` → SQLite → `core.py` → HTML report
 
 ## Key Conventions
 
 - **Language**: All user-facing strings are in Russian. Variable names and docstrings in English.
-- **Config**: All secrets and environment-dependent values in `.env`. `config.py` calls `_require_env()` for mandatory vars — process exits at import time if missing.
+- **Config**: All secrets and environment-dependent values in `.env`. `config.py` defines `_validate_config()` which checks ranges and paths — called explicitly from `bot.py main()` (not at import time, so tests can import without `.env`).
 - **Database**: SQLite via `sqlite3` (stdlib). Schema auto-created by `db.init_db()`. Tables:
-  - `requests` — заявки
+  - `requests` — заявки (with `status`: `new`/`ordered`/`delivered`/`done`/`archived`)
   - `request_photos` — фото к заявкам (связь 1:N с `requests`)
   - `lists` — справочники (`list_type`: `initiator`, `object`, `unit`)
   - `settings` — настройки (кнопок в строке и т.д.)
   - `initiator_users` — привязка инициаторов к Telegram-ID
+  - `audit_log` — журнал действий (created/completed/edited/status_changed/deleted)
+  - `conversation_state` — сохранённые черновики диалогов (persistent across restarts)
 - **Conversation states (заявки)**: `NAME → QUANTITY → UNIT → INITIATOR (auto-skip if linked) → INITIATOR_CUSTOM → OBJECT → OBJECT_CUSTOM → NOTES → PHOTO → CONFIRM`. PHOTO accepts photos, `✅ Готово`, `➡️ Пропустить`, or `❌ Отмена`. CONFIRM accepts `✅ Подтвердить`, `🔄 Повторить`, or `❌ Отмена`.
 - **Conversation states (регистрация)**: `REG_NAME` — non-admin users pick their initiator name on first `/start`.
 - **Conversation states (завершение заявки)**: `COMPLETE_SELECT → COMPLETE_CONFIRM` — admin selects active request to mark done.
@@ -44,11 +46,13 @@ Data flow: `bot.py` → `db.py` → SQLite → `core.py` → HTML report
 1. `register_conv` — `/start` for unregistered non-admin users (registration)
 2. `CommandHandler("start", start)` — `/start` for admins and registered users
 3. `analysis_handler` — `📊 Анализ` button
-4. `complete_handler` — `✅ Завершить заявку` button
-5. `admin_handler` — `⚙️ Настройки` button
-6. `conv_handler` — `➕ Добавить заявку` button
-7. `CallbackQueryHandler(show_request_photos)` — photo viewing from reports
-8. `handle_menu` — catch-all for remaining text
+4. `complete_handler` — `✅ Завершить заявку` button (with pagination and batch complete)
+5. `status_handler` — `/status` command (admin: change request status)
+6. `my_requests_handler` — `📋 Мои заявки` button (with pagination and search)
+7. `admin_handler` — `⚙️ Настройки` button (now includes backup and audit log)
+8. `conv_handler` — `➕ Добавить заявку` button
+9. `CallbackQueryHandler(show_request_photos)` — photo viewing from reports
+10. `handle_menu` — catch-all for remaining text
 
 **Important**: `start()` must return `ConversationHandler.END` for admins and registered users to avoid blocking subsequent handlers.
 
@@ -86,7 +90,8 @@ black --check --diff .
 - **DB tests**: `test_db.py` uses a `tmp_path` fixture with `patch.object(db, "DB_PATH", ...)` to isolate each test to a temporary database.
 - **Core tests**: `test_core.py` mocks `db.get_active_requests` and `db.get_photo_counts` to return fixture data.
 - **Bot tests**: `test_bot.py` mocks `db.get_all_lists`, `db.add_request_with_photos`, and `db.add_request_photo` to avoid real DB calls.
-- **All 48 tests pass**.
+- **Integration tests**: `test_integration.py` tests full conversation flows (create request, complete, register, cancel, rate limit, field limits).
+- **All 77 tests pass**.
 
 When adding new tests:
 - Async bot handlers: use `@pytest.mark.asyncio`, mock `update.message.reply_text` with `AsyncMock()`, mock `context.user_data` as a plain dict.
@@ -94,7 +99,7 @@ When adding new tests:
 
 ## Common Pitfalls
 
-- **Import-time side effects**: `config.py` calls `sys.exit(1)` if required env vars are missing. Tests that import `core` or `bot` transitively import `config`. The `.env` file must exist with valid values.
+- **Import-time side effects**: `config.py` calls `_require_env()` at import time for mandatory vars. `_validate_config()` is called explicitly from `bot.py main()`. Tests set env vars in `conftest.py` before any imports.
 - **SQLite file locking**: Only one process should write to `bot.db` at a time. The `get_conn()` context manager uses WAL journal mode for better concurrency.
 - **SQLite placeholder limit**: `SQLITE_MAX_VARIABLE_NUMBER = 999`. Use batch queries (see `get_photo_counts()` for example).
 - **ConversationHandler fallbacks**: The `❌ Отмена` button is handled via `MessageHandler(filters.Regex('^❌ Отмена$'), cancel)` in fallbacks, not per-state. This means it works in all states including CONFIRM.
@@ -108,7 +113,7 @@ When adding new tests:
 
 ## Files to Touch Together
 
-- Changing conversation flow → update `bot.py` (handlers + ConversationHandler states) and `tests/test_bot.py`
+- Changing conversation flow → update `bot.py` (handlers + ConversationHandler states), `tests/test_bot.py`, and `tests/test_integration.py`
 - Changing report format → update `core.py` and `tests/test_core.py`
 - Changing DB schema → update `db.py` (schema + CRUD) and `tests/test_db.py`
 - Adding a new env var → add to `config.py`, update `.env.example` if present, update README.md
@@ -145,4 +150,24 @@ When adding new tests:
 - `context.user_data.clear()` is NOT called on save errors — user can retry with `🔄 Повторить`.
 
 ### Rate limiting
-- No rate limiting is currently implemented. Consider adding per-user throttling for production use.
+- `RateLimiter` in `utils.py` implements per-user sliding window (default: 5 requests / 60 sec).
+- Configurable via `RATE_LIMIT_REQUESTS` and `RATE_LIMIT_WINDOW_SEC` env vars.
+- Applied to `/start` and `➕ Добавить заявку` entry points.
+- `context.user_data["_saving"]` flag prevents double-submit on confirm.
+
+### Backup and audit
+- `backup_db()` creates a copy via SQLite backup API; `verify_backup()` checks integrity.
+- `clear_all_requests()` auto-backs up before wipe; aborts if backup verification fails.
+- `audit_log` table records all significant actions with user_id, action type, and details.
+- Admin panel includes `💾 Резервная копия` and `📋 Журнал действий` sections.
+
+### Persistent state
+- `conversation_state` table stores `user_data` as JSON at each conversation step.
+- `_save_draft()` called after each step; `clear_conversation_state()` on cancel/complete.
+- Drafts survive bot restarts.
+
+### Input validation
+- `truncate_field()` limits all text inputs to `MAX_FIELD_LENGTH` (default: 500).
+- `MAX_PHOTOS_PER_REQUEST` (default: 5) enforced during photo upload.
+- `DB_PATH` defaults to `bot.db` next to `bot.py`; cloud deploys override via `.env`.
+- `_validate_config()` checks ranges at startup (REPORT_HOUR, OVERDUE_DAYS, ADMIN_IDS, DB path).
