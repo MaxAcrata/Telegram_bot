@@ -29,6 +29,7 @@ from bot import (
     cancel,
     complete_start,
     complete_select_handler,
+    complete_comment_handler,
     complete_confirm_handler,
     my_requests_start,
     NAME,
@@ -43,6 +44,7 @@ from bot import (
     CONFIRM,
     REG_NAME,
     COMPLETE_SELECT,
+    COMPLETE_COMMENT,
     COMPLETE_CONFIRM,
     MY_REQUESTS_SELECT,
 )
@@ -374,20 +376,25 @@ async def test_complete_request_flow(
     result = await complete_start(u, ctx)
     assert result == COMPLETE_SELECT
 
-    # Шаг 2: Выбрать заявку
+    # Шаг 2: Выбрать заявку → переход к комментарию
     u = make_callback_update("cr:5", user_id=123)
     ctx = make_context()
     result = await complete_select_handler(u, ctx)
-    assert result == COMPLETE_CONFIRM
+    assert result == COMPLETE_COMMENT
     assert ctx.user_data["complete_request"] == req
 
-    # Шаг 3: Подтвердить
+    # Шаг 3: Без комментария → переход к подтверждению
+    u = make_callback_update("cr:nocomment", user_id=123)
+    with patch("bot._safe_edit", new_callable=AsyncMock):
+        result = await complete_comment_handler(u, ctx)
+    assert result == COMPLETE_CONFIRM
+
+    # Шаг 4: Подтвердить
     with patch(
         "bot.complete_request",
         return_value={**req, "done_date": "2026-10-05", "status": "done"},
     ) as mock_complete, patch("bot.get_initiator_tg_id", return_value=999):
         u = make_callback_update("cr:confirm", user_id=123)
-        ctx = make_context({"complete_request": req})
         result = await complete_confirm_handler(u, ctx)
         assert result == ConversationHandler.END
         mock_complete.assert_called_once_with(

@@ -227,11 +227,12 @@ def test_build_report_empty(mock_get, mock_photos):
     mock_get.return_value = []
     mock_photos.return_value = {}
 
-    report, ids = build_report(save_to_file=False)
+    report, ids, all_ids = build_report(save_to_file=False)
 
     assert "активных заявок нет" in report
     assert "Всего активных: <b>0</b>" in report
     assert ids == []
+    assert all_ids == []
 
 
 @patch("core.get_photo_counts")
@@ -266,7 +267,7 @@ def test_build_report_with_tasks(mock_get, mock_photos):
     ]
     mock_photos.return_value = {}
 
-    report, ids = build_report(save_to_file=False)
+    report, ids, all_ids = build_report(save_to_file=False)
 
     assert "Всего активных: <b>2</b>" in report
     assert "Новая: <b>1</b>" in report
@@ -295,7 +296,7 @@ def test_build_report_overdue_section(mock_get, mock_photos):
     ]
     mock_photos.return_value = {}
 
-    report, ids = build_report(save_to_file=False)
+    report, ids, all_ids = build_report(save_to_file=False)
 
     assert "ПРОСРОЧЕННЫЕ ЗАЯВКИ" in report
     assert "Иван" in report
@@ -321,7 +322,7 @@ def test_build_report_with_links(mock_get, mock_photos):
     ]
     mock_photos.return_value = {}
 
-    report, ids = build_report(save_to_file=False)
+    report, ids, all_ids = build_report(save_to_file=False)
 
     assert "Примечание:" in report
     assert '<a href="https://example.com">' in report
@@ -359,7 +360,7 @@ def test_build_report_photo_ids(mock_get, mock_photos):
     ]
     mock_photos.return_value = {1: 3}
 
-    report, ids = build_report(save_to_file=False)
+    report, ids, all_ids = build_report(save_to_file=False)
 
     assert 1 in ids
     assert 2 not in ids
