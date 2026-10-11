@@ -3,6 +3,7 @@ import json
 import logging
 from datetime import time, datetime, date
 from html import escape
+from zoneinfo import ZoneInfo
 from telegram import (
     Update,
     ReplyKeyboardMarkup,
@@ -33,11 +34,15 @@ from config import (
     RATE_LIMIT_WINDOW_SEC,
     MAX_FIELD_LENGTH,
     MAX_PHOTOS_PER_REQUEST,
+    REPORT_TIMEZONE,
+    OVERDUE_DAYS,
 )
 from core import build_report, build_dashboard
 from db import (
     init_db,
     get_all_lists,
+    get_list_items,
+    get_list_value_by_id,
     add_request_with_photos,
     rename_list_value,
     delete_list_value,
@@ -70,6 +75,7 @@ from db import (
     get_requests_by_status,
     VALID_STATUSES,
     STATUS_LABELS,
+    save_user_input,
 )
 from utils import validate_quantity, split_message, RateLimiter, truncate_field
 
@@ -127,9 +133,13 @@ EDIT_SELECT_FIELD, EDIT_INPUT_VALUE = 140, 141
 # ===== СОСТОЯНИЯ УДАЛЕНИЯ ЗАЯВКИ =====
 DELETE_CONFIRM = 145
 
-# ===== КЛАВИАТУРА ОТМЕНЫ =====
+# ===== КЛАВИАТУРЫ =====
 CANCEL_KEYBOARD = ReplyKeyboardMarkup(
     [["❌ Отмена"]], resize_keyboard=True, one_time_keyboard=False
+)
+
+BACK_CANCEL_KEYBOARD = ReplyKeyboardMarkup(
+    [["⬅️ Назад", "❌ Отмена"]], resize_keyboard=True, one_time_keyboard=False
 )
 
 
@@ -148,16 +158,21 @@ def _user_name(update: Update) -> str:
 def get_main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
     """Возвращает главную клавиатуру в зависимости от прав"""
     if is_admin(user_id):
+        # Админское меню с логической группировкой
         keyboard = [
-            ["📋 Заявки", "📊 Дашборд"],
-            ["📊 Анализ"],
-            ["➕ Добавить заявку"],
-            ["✅ Завершить заявку"],
-            ["📋 Мои заявки"],
+            # Основные действия
+            ["➕ Добавить заявку", "📋 Мои заявки"],
+            # Управление заявками
+            ["📋 Заявки", "✅ Завершить заявку"],
+            # Аналитика
+            ["📊 Дашборд", "📊 Анализ"],
+            # Настройки
             ["⚙️ Настройки"],
+            # Выход
             ["⛔ Выход"],
         ]
     else:
+        # Пользовательское меню
         keyboard = [
             ["➕ Добавить заявку"],
             ["📋 Мои заявки"],
@@ -203,6 +218,23 @@ async def _safe_edit(query, text, **kwargs):
         logger.error(f"TelegramError в _safe_edit: {e}")
 
 
+async def _safe_callback_reply(update, text, **kwargs):
+    """Отправляет ответ в контексте callback (без update.message)."""
+    try:
+        chat_id = None
+        if hasattr(update, "callback_query") and update.callback_query and update.callback_query.message:
+            chat_id = update.callback_query.message.chat_id
+        elif hasattr(update, "effective_chat") and update.effective_chat:
+            chat_id = update.effective_chat.id
+        if chat_id:
+            # Используем bot.send_message напрямую
+            await update.callback_query.message.chat.send_message(text, **kwargs)
+            return
+        logger.error("_safe_callback_reply: не удалось определить chat_id")
+    except TelegramError as e:
+        logger.error(f"TelegramError в _safe_callback_reply: {e}")
+
+
 async def send_long_message(
     context: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
@@ -234,7 +266,7 @@ def _truncate_callback_data(prefix: str, value: str, max_bytes: int = 64) -> str
 
 
 def _build_photo_keyboard(
-    ids_with_photos: list, all_ids: list = None
+    ids_with_photos: list, all_ids: list = None, requests_data: list = None
 ) -> InlineKeyboardMarkup:
     """Создаёт inline-клавиатуру с кнопками деталей и просмотра фото."""
     buttons = []
@@ -242,10 +274,40 @@ def _build_photo_keyboard(
     if all_ids:
         for rid in all_ids:
             has_photo = "📎" if rid in (ids_with_photos or []) else ""
+
+            # Определяем эмодзи статуса
+            status_emoji = "⚪"  # по умолчанию - новая
+            if requests_data:
+                for req in requests_data:
+                    if req.get("id") == rid:
+                        status = req.get("status", "new")
+                        if status == "done":
+                            status_emoji = "⚪"  # выполненная - белый
+                        elif status == "ordered":
+                            status_emoji = "🟡"  # заказанная - желтый
+                        elif status == "delivered":
+                            status_emoji = "🔵"  # доставленная - синий
+                        else:
+                            # Проверяем просрочку
+                            req_date_str = req.get("request_date")
+                            if req_date_str:
+                                try:
+                                    req_date = date.fromisoformat(req_date_str)
+                                    today = date.today()
+                                    if (today - req_date).days > OVERDUE_DAYS:
+                                        status_emoji = "🔴"  # просроченная - красный
+                                    else:
+                                        status_emoji = "🟢"  # новая - зеленый
+                                except (ValueError, TypeError):
+                                    status_emoji = "🟢"
+                            else:
+                                status_emoji = "🟢"
+                        break
+
             buttons.append(
                 [
                     InlineKeyboardButton(
-                        f"📋 #{rid} Детали {has_photo}".strip(),
+                        f"{status_emoji} #{rid} {has_photo}".strip(),
                         callback_data=f"detail:{rid}",
                     )
                 ]
@@ -314,7 +376,9 @@ async def show_request_photos(update: Update, context: ContextTypes.DEFAULT_TYPE
     file_ids = get_request_photos(req_id)
 
     if not file_ids:
-        await _safe_reply(update, "📷 Фото не найдены.")
+        await _safe_send(
+            context, query.message.chat_id, "📷 Фото не найдены."
+        )
         return
 
     for file_id in file_ids:
@@ -336,7 +400,9 @@ async def show_request_photos(update: Update, context: ContextTypes.DEFAULT_TYPE
                 logger.warning(f"Не удалось отправить фото после retry: {e2}")
         except Exception as e:
             logger.warning(f"Не удалось отправить фото {file_id}: {e}")
-            await _safe_reply(update, "⚠️ Не удалось отправить одно из фото.")
+            await _safe_send(
+                context, query.message.chat_id, "⚠️ Не удалось отправить одно из фото."
+            )
 
 
 async def show_request_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -376,7 +442,7 @@ async def show_request_details(update: Update, context: ContextTypes.DEFAULT_TYP
         f"📅 Дата: {escape(req.get('request_date', '—'))}"
     )
     if notes and notes != "-":
-        text += f"\n📝 Примечание: {escape(notes)}"
+        text += f"\n📝 Дополнительно: {escape(notes)}"
     if photo_text:
         text += photo_text
 
@@ -417,8 +483,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         markup = get_main_keyboard(user_id)
         text = (
             f"👋 Здравствуйте, <b>{escape(username)}</b>!\n\n"
+            f"Вы вошли как <b>администратор</b>.\n"
             f"Автоотчёт приходит каждый день в {REPORT_HOUR:02d}:{REPORT_MINUTE:02d}.\n\n"
-            "Выберите действие:"
+            "📋 <b>Возможности администратора:</b>\n"
+            "• ➕ Создавать заявки на материалы\n"
+            "• 📋 Просматривать и управлять всеми заявками\n"
+            "• ✅ Завершать заявки и менять статусы\n"
+            "• 📊 Смотреть аналитику и дашборд\n"
+            "• ⚙️ Настраивать справочники\n\n"
+            "Выберите действие из меню ниже:"
         )
         await _safe_reply(update, text, reply_markup=markup, parse_mode="HTML")
         return ConversationHandler.END
@@ -428,8 +501,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _safe_reply(
                 update,
                 f"👋 Здравствуйте, <b>{escape(username)}</b>!\n\n"
-                f"Вы привязаны как <b>{escape(existing)}</b>.\n"
-                "Используйте бот для добавления заявок.",
+                f"Вы привязаны как <b>{escape(existing)}</b>.\n\n"
+                "📋 <b>Ваши возможности:</b>\n"
+                "• ➕ Создавать заявки на стройматериалы\n"
+                "• 📋 Просматривать свои заявки\n"
+                "• 🔔 Получать уведомления о статусе\n\n"
+                "Выберите действие из меню ниже:",
                 reply_markup=get_main_keyboard(user_id),
                 parse_mode="HTML",
             )
@@ -457,8 +534,17 @@ async def register_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await _safe_reply(
         update,
-        "👋 <b>Добро пожаловать!</b>\n\n"
-        "Выберите своё имя из списка, чтобы получать уведомления о заявках:",
+        "👋 <b>Добро пожаловать в бот «Управление заявками»!</b>\n\n"
+        "📦 <b>Что я умею:</b>\n"
+        "• Создавать заявки на стройматериалы\n"
+        "• Отслеживать статус ваших заявок\n"
+        "• Отправлять уведомления о выполнении\n\n"
+        "👤 <b>Давайте настроим ваш профиль!</b>\n\n"
+        "Выберите своё имя из списка ниже.\n"
+        "Это нужно, чтобы:\n"
+        "• Автоматически подставлять имя в заявки\n"
+        "• Получать уведомления о ваших заявках\n\n"
+        "<i>Если вашего имени нет в списке — выберите «Другое»</i>",
         reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True),
         parse_mode="HTML",
     )
@@ -495,9 +581,15 @@ async def register_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     audit_log(None, user_id, _user_name(update), "registered", f"Имя: {text}")
     await _safe_reply(
         update,
-        f"✅ Вы привязаны как <b>{escape(text)}</b>.\n\n"
-        "Теперь вы будете получать уведомления о выполнении ваших заявок.\n"
-        "Используйте «➕ Добавить заявку» для создания заявки.",
+        f"🎉 <b>Отлично! Вы зарегистрированы как «{escape(text)}»</b>\n\n"
+        "📋 <b>Что теперь:</b>\n"
+        "• Ваше имя будет автоматически подставляться в заявки\n"
+        "• Вы будете получать уведомления о статусе заявок\n\n"
+        "🚀 <b>Быстрый старт:</b>\n"
+        "1. Нажмите «➕ Добавить заявку»\n"
+        "2. Заполните форму (это займёт 1-2 минуты)\n"
+        "3. Получите номер заявки и отслеживайте статус\n\n"
+        "<i>💡 Совет: Используйте кнопки меню для навигации</i>",
         reply_markup=get_main_keyboard(user_id),
         parse_mode="HTML",
     )
@@ -513,8 +605,8 @@ async def run_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _safe_reply(update, "⏳ Запускаю анализ...")
 
     try:
-        result, ids_with_photos, all_ids = build_report(mode="active")
-        keyboard = _build_photo_keyboard(ids_with_photos, all_ids)
+        result, ids_with_photos, all_ids, requests_data = build_report(mode="active")
+        keyboard = _build_photo_keyboard(ids_with_photos, all_ids, requests_data)
         await send_long_message(
             context,
             update.effective_chat.id,
@@ -562,12 +654,45 @@ async def start_add_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _safe_reply(update, "⏳ Слишком много запросов. Подождите немного.")
         return ConversationHandler.END
 
+    # Проверяем наличие сохранённого черновика
+    saved_state = load_conversation_state(user_id)
+    if saved_state:
+        try:
+            saved_data = json.loads(saved_state)
+            if isinstance(saved_data, dict) and saved_data.get("draft_id"):
+                keyboard = ReplyKeyboardMarkup(
+                    [
+                        ["✏️ Продолжить черновик", "🔄 Новая заявка"],
+                        ["❌ Отмена"],
+                    ],
+                    resize_keyboard=True,
+                )
+                summary_parts = []
+                if saved_data.get("name"):
+                    summary_parts.append(f"📦 {saved_data['name']}")
+                if saved_data.get("quantity"):
+                    summary_parts.append(
+                        f"🔢 {saved_data['quantity']} {saved_data.get('unit', '')}"
+                    )
+                summary = "\n".join(summary_parts) if summary_parts else "(пустой черновик)"
+                await _safe_reply(
+                    update,
+                    f"📋 Найден незавершённый черновик:\n\n{summary}\n\n"
+                    "Продолжить заполнение или начать заново?",
+                    reply_markup=keyboard,
+                    parse_mode="HTML",
+                )
+                context.user_data["pending_draft"] = saved_data
+                return NAME
+        except (json.JSONDecodeError, TypeError):
+            pass
+
     context.user_data.clear()
     context.user_data["draft_id"] = f"{user_id}_{datetime.now().timestamp()}"
 
     await _safe_reply(
         update,
-        "📦 <b>Шаг 1/7:</b> Введите наименование товара/услуги:",
+        "📦 <b>Шаг 1/6:</b> Введите наименование материала или товара:",
         reply_markup=CANCEL_KEYBOARD,
         parse_mode="HTML",
     )
@@ -576,13 +701,89 @@ async def start_add_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def set_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Сохраняет название и запрашивает количество"""
-    name = truncate_field(update.message.text.strip(), MAX_FIELD_LENGTH)
+    text = update.message.text.strip()
+
+    # Проверка на отмену
+    cancel_keywords = ["❌ Отмена", "Отмена", "отмена", "cancel"]
+    if text in cancel_keywords or text.lower() in ["отмена", "cancel"]:
+        user_id = update.effective_user.id
+        context.user_data.clear()
+        clear_conversation_state(user_id)
+        await _safe_reply(
+            update, "❌ Заявка отменена.", reply_markup=get_main_keyboard(user_id)
+        )
+        return ConversationHandler.END
+
+    # Обработка выбора черновика
+    if text == "✏️ Продолжить черновик":
+        pending = context.user_data.pop("pending_draft", None)
+        if pending:
+            context.user_data.update(pending)
+            clear_conversation_state(update.effective_user.id)
+            # Определяем следующий шаг по заполненности данных
+            if not pending.get("name"):
+                await _safe_reply(
+                    update,
+                    "📦 <b>Шаг 1/6:</b> Введите наименование материала или товара:",
+                    reply_markup=CANCEL_KEYBOARD,
+                    parse_mode="HTML",
+                )
+                return NAME
+            if not pending.get("quantity"):
+                await _safe_reply(
+                    update,
+                    f"📦 Текущее наименование: <code>{escape(pending['name'])}</code>\n\n"
+                    "🔢 <b>Шаг 2/6:</b> Введите количество:",
+                    reply_markup=CANCEL_KEYBOARD,
+                    parse_mode="HTML",
+                )
+                return QUANTITY
+            # Для остальных шагов — показываем сводку и просим продолжить
+            summary = f"📦 {escape(pending['name'])} | 🔢 {escape(str(pending.get('quantity', '')))} {escape(pending.get('unit', ''))}"
+            await _safe_reply(
+                update,
+                f"📋 Черновик восстановлен: {summary}\n\n"
+                "Продолжайте заполнение с текущего шага. Введите значение для следующего поля "
+                "или нажмите ❌ Отмена.",
+                reply_markup=CANCEL_KEYBOARD,
+                parse_mode="HTML",
+            )
+            return NAME
+        # Черновик пуст — новая заявка
+        context.user_data.clear()
+        context.user_data["draft_id"] = f"{update.effective_user.id}_{datetime.now().timestamp()}"
+        await _safe_reply(
+            update,
+            "📦 <b>Шаг 1/6:</b> Введите наименование материала или товара:",
+            reply_markup=CANCEL_KEYBOARD,
+            parse_mode="HTML",
+        )
+        return NAME
+
+    if text == "🔄 Новая заявка":
+        context.user_data.clear()
+        clear_conversation_state(update.effective_user.id)
+        context.user_data["draft_id"] = f"{update.effective_user.id}_{datetime.now().timestamp()}"
+        await _safe_reply(
+            update,
+            "📦 <b>Шаг 1/6:</b> Введите наименование материала или товара:",
+            reply_markup=CANCEL_KEYBOARD,
+            parse_mode="HTML",
+        )
+        return NAME
+
+    name = truncate_field(text, MAX_FIELD_LENGTH)
     context.user_data["name"] = name
     _save_draft(update, context)
+
+    # Сохраняем в историю
+    user_id = update.effective_user.id
+    save_user_input(user_id, "name", name)
+
     await _safe_reply(
         update,
-        "🔢 <b>Шаг 2/7:</b> Введите количество (только число):",
-        reply_markup=CANCEL_KEYBOARD,
+        "🔢 <b>Шаг 2/6:</b> Введите количество:",
+        reply_markup=BACK_CANCEL_KEYBOARD,
         parse_mode="HTML",
     )
     return QUANTITY
@@ -590,17 +791,56 @@ async def set_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def set_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Сохраняет количество и запрашивает единицу измерения"""
-    qty = update.message.text.strip()
+    text = update.message.text.strip()
 
-    if not validate_quantity(qty):
+    # Проверка на отмену
+    cancel_keywords = ["❌ Отмена", "Отмена", "отмена", "cancel"]
+    if text in cancel_keywords or text.lower() in ["отмена", "cancel"]:
+        user_id = update.effective_user.id
+        context.user_data.clear()
+        clear_conversation_state(user_id)
+        await _safe_reply(
+            update, "❌ Заявка отменена.", reply_markup=get_main_keyboard(user_id)
+        )
+        return ConversationHandler.END
+
+    # Обработка кнопки "Назад"
+    if text == "⬅️ Назад":
         await _safe_reply(
             update,
-            "❌ Пожалуйста, введите <b>число</b> (например, 10 или 5.5):",
+            "📦 <b>Шаг 1/6:</b> Введите наименование материала или товара:\n\n"
+            f"Текущее значение: <code>{escape(context.user_data.get('name', ''))}</code>",
+            reply_markup=BACK_CANCEL_KEYBOARD,
+            parse_mode="HTML",
+        )
+        return NAME
+
+    if not validate_quantity(text):
+        await _safe_reply(
+            update,
+            "❌ <b>Неверный формат количества</b>\n\n"
+            "Пожалуйста, введите положительное число.\n\n"
+            "✅ <b>Правильные примеры:</b>\n"
+            "• 10\n"
+            "• 5.5\n"
+            "• 0.25\n"
+            "• 1000\n\n"
+            "❌ <b>Неправильные примеры:</b>\n"
+            "• -5 (отрицательное)\n"
+            "• 0 (ноль)\n"
+            "• abc (текст)\n\n"
+            "💡 <i>Используйте точку или запятую для дробей</i>\n\n"
+            "Или нажмите «⬅️ Назад» для возврата к предыдущему шагу.",
+            reply_markup=BACK_CANCEL_KEYBOARD,
             parse_mode="HTML",
         )
         return QUANTITY
 
-    context.user_data["quantity"] = qty
+    context.user_data["quantity"] = text
+
+    # Сохраняем в историю
+    user_id = update.effective_user.id
+    save_user_input(user_id, "quantity", text)
 
     try:
         lists = get_all_lists()
@@ -610,11 +850,11 @@ async def set_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     cols = int(get_setting("buttons_per_row_unit", "3"))
     keyboard = [units[i : i + cols] for i in range(0, len(units), cols)]
-    keyboard.append(["❌ Отмена"])
+    keyboard.append(["⬅️ Назад", "❌ Отмена"])
     _save_draft(update, context)
     await _safe_reply(
         update,
-        "📏 <b>Шаг 3/7:</b> Выберите единицу измерения:",
+        "📏 <b>Шаг 3/6:</b> Выберите единицу:",
         reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True),
         parse_mode="HTML",
     )
@@ -623,9 +863,32 @@ async def set_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def set_unit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Сохраняет единицу измерения и запрашивает инициатора (или ставит автоматически)"""
-    context.user_data["unit"] = truncate_field(
-        update.message.text.strip(), MAX_FIELD_LENGTH
-    )
+    text = update.message.text.strip()
+
+    # Проверка на отмену
+    cancel_keywords = ["❌ Отмена", "Отмена", "отмена", "cancel"]
+    if text in cancel_keywords or text.lower() in ["отмена", "cancel"]:
+        user_id = update.effective_user.id
+        context.user_data.clear()
+        clear_conversation_state(user_id)
+        await _safe_reply(
+            update, "❌ Заявка отменена.", reply_markup=get_main_keyboard(user_id)
+        )
+        return ConversationHandler.END
+
+    # Обработка кнопки "Назад"
+    if text == "⬅️ Назад":
+        # Возвращаемся к вводу количества
+        await _safe_reply(
+            update,
+            "🔢 <b>Шаг 2/6:</b> Введите количество:\n\n"
+            f"Текущее значение: <code>{escape(context.user_data.get('quantity', ''))}</code>",
+            reply_markup=BACK_CANCEL_KEYBOARD,
+            parse_mode="HTML",
+        )
+        return QUANTITY
+
+    context.user_data["unit"] = truncate_field(text, MAX_FIELD_LENGTH)
 
     user_id = update.effective_user.id
     linked_name = get_initiator_by_tg_id(user_id)
@@ -640,12 +903,12 @@ async def set_unit(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         cols = int(get_setting("buttons_per_row_object", "2"))
         keyboard = [objects[i : i + cols] for i in range(0, len(objects), cols)]
-        keyboard.append(["❌ Отмена"])
+        keyboard.append(["⬅️ Назад", "❌ Отмена"])
         _save_draft(update, context)
         await _safe_reply(
             update,
             f"👤 Инициатор: <b>{escape(linked_name)}</b> (автоматически)\n\n"
-            "🏗️ <b>Шаг 5/7:</b> Выберите объект:",
+            "🏗️ <b>Шаг 5/6:</b> Выберите объект:",
             reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True),
             parse_mode="HTML",
         )
@@ -662,11 +925,11 @@ async def set_unit(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     cols = int(get_setting("buttons_per_row_initiator", "4"))
     keyboard = [initiators[i : i + cols] for i in range(0, len(initiators), cols)]
-    keyboard.append(["❌ Отмена"])
+    keyboard.append(["⬅️ Назад", "❌ Отмена"])
     _save_draft(update, context)
     await _safe_reply(
         update,
-        "👤 <b>Шаг 4/7:</b> Выберите инициатора:",
+        "👤 <b>Шаг 4/6:</b> Выберите инициатора:",
         reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True),
         parse_mode="HTML",
     )
@@ -675,18 +938,50 @@ async def set_unit(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def set_initiator(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Сохраняет инициатора и запрашивает объект"""
-    initiator = update.message.text.strip()
+    text = update.message.text.strip()
 
-    if initiator == "Другое":
+    # Проверка на отмену
+    cancel_keywords = ["❌ Отмена", "Отмена", "отмена", "cancel"]
+    if text in cancel_keywords or text.lower() in ["отмена", "cancel"]:
+        user_id = update.effective_user.id
+        context.user_data.clear()
+        clear_conversation_state(user_id)
+        await _safe_reply(
+            update, "❌ Заявка отменена.", reply_markup=get_main_keyboard(user_id)
+        )
+        return ConversationHandler.END
+
+    # Обработка кнопки "Назад"
+    if text == "⬅️ Назад":
+        # Возвращаемся к выбору единицы измерения
+        try:
+            lists = get_all_lists()
+            units = lists.get("unit", ["шт", "кг", "л", "м2", "м3", "лист", "м.п.", "комп"])
+        except Exception:
+            units = ["шт", "кг", "л", "м2", "м3", "лист", "м.п.", "комп"]
+
+        cols = int(get_setting("buttons_per_row_unit", "3"))
+        keyboard = [units[i : i + cols] for i in range(0, len(units), cols)]
+        keyboard.append(["⬅️ Назад", "❌ Отмена"])
+        await _safe_reply(
+            update,
+            "📏 <b>Шаг 3/6:</b> Выберите единицу:\n\n"
+            f"Текущее значение: <code>{escape(context.user_data.get('unit', ''))}</code>",
+            reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True),
+            parse_mode="HTML",
+        )
+        return UNIT
+
+    if text == "Другое":
         await _safe_reply(
             update,
             "✍️ Введите имя инициатора:",
-            reply_markup=CANCEL_KEYBOARD,
+            reply_markup=BACK_CANCEL_KEYBOARD,
             parse_mode="HTML",
         )
         return INITIATOR_CUSTOM
 
-    context.user_data["initiator"] = truncate_field(initiator, MAX_FIELD_LENGTH)
+    context.user_data["initiator"] = truncate_field(text, MAX_FIELD_LENGTH)
 
     try:
         lists = get_all_lists()
@@ -696,11 +991,11 @@ async def set_initiator(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     cols = int(get_setting("buttons_per_row_object", "2"))
     keyboard = [objects[i : i + cols] for i in range(0, len(objects), cols)]
-    keyboard.append(["❌ Отмена"])
+    keyboard.append(["⬅️ Назад", "❌ Отмена"])
     _save_draft(update, context)
     await _safe_reply(
         update,
-        "🏗️ <b>Шаг 5/7:</b> Выберите объект:",
+        "🏗️ <b>Шаг 5/6:</b> Выберите объект:",
         reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True),
         parse_mode="HTML",
     )
@@ -725,7 +1020,7 @@ async def set_initiator_custom(update: Update, context: ContextTypes.DEFAULT_TYP
     _save_draft(update, context)
     await _safe_reply(
         update,
-        "🏗️ <b>Шаг 5/7:</b> Выберите объект:",
+        "🏗️ <b>Шаг 5/6:</b> Выберите объект:",
         reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True),
         parse_mode="HTML",
     )
@@ -734,26 +1029,61 @@ async def set_initiator_custom(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def set_object(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Сохраняет объект и запрашивает примечание"""
-    obj = update.message.text.strip()
+    text = update.message.text.strip()
 
-    if obj == "Другое":
+    # Проверка на отмену
+    cancel_keywords = ["❌ Отмена", "Отмена", "отмена", "cancel"]
+    if text in cancel_keywords or text.lower() in ["отмена", "cancel"]:
+        user_id = update.effective_user.id
+        context.user_data.clear()
+        clear_conversation_state(user_id)
+        await _safe_reply(
+            update, "❌ Заявка отменена.", reply_markup=get_main_keyboard(user_id)
+        )
+        return ConversationHandler.END
+
+    # Обработка кнопки "Назад"
+    if text == "⬅️ Назад":
+        # Возвращаемся к выбору инициатора
+        try:
+            lists = get_all_lists()
+            initiators = lists.get(
+                "initiator", ["Алексей", "Анатолий", "Михаил", "Игорь", "Другое"]
+            )
+        except Exception as e:
+            logger.error(f"Ошибка загрузки списков: {e}")
+            initiators = ["Алексей", "Анатолий", "Михаил", "Игорь", "Другое"]
+
+        cols = int(get_setting("buttons_per_row_initiator", "4"))
+        keyboard = [initiators[i : i + cols] for i in range(0, len(initiators), cols)]
+        keyboard.append(["⬅️ Назад", "❌ Отмена"])
+        await _safe_reply(
+            update,
+            "👤 <b>Шаг 4/6:</b> Выберите инициатора:\n\n"
+            f"Текущее значение: <code>{escape(context.user_data.get('initiator', ''))}</code>",
+            reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True),
+            parse_mode="HTML",
+        )
+        return INITIATOR
+
+    if text == "Другое":
         await _safe_reply(
             update,
             "✍️ Введите название объекта:",
-            reply_markup=CANCEL_KEYBOARD,
+            reply_markup=BACK_CANCEL_KEYBOARD,
             parse_mode="HTML",
         )
         return OBJECT_CUSTOM
 
-    context.user_data["object"] = truncate_field(obj, MAX_FIELD_LENGTH)
+    context.user_data["object"] = truncate_field(text, MAX_FIELD_LENGTH)
 
     notes_keyboard = ReplyKeyboardMarkup(
-        [["➡️ Пропустить", "❌ Отмена"]], resize_keyboard=True
+        [["➡️ Пропустить", "⬅️ Назад", "❌ Отмена"]], resize_keyboard=True
     )
     _save_draft(update, context)
     await _safe_reply(
         update,
-        "📝 <b>Шаг 6/7:</b> Добавьте примечание (ссылки допустимы):",
+        "📝 <b>Шаг 6/6:</b> Дополнительно (ссылки допустимы):",
         reply_markup=notes_keyboard,
         parse_mode="HTML",
     )
@@ -772,7 +1102,7 @@ async def set_object_custom(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _save_draft(update, context)
     await _safe_reply(
         update,
-        "📝 <b>Шаг 6/7:</b> Добавьте примечание (ссылки допустимы):",
+        "📝 <b>Шаг 6/6:</b> Дополнительно (ссылки допустимы):",
         reply_markup=notes_keyboard,
         parse_mode="HTML",
     )
@@ -780,27 +1110,70 @@ async def set_object_custom(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def set_notes_and_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Сохраняет примечание и переходит к шагу фото"""
-    notes = update.message.text.strip()
-    if notes in ("-", "➡️ Пропустить"):
-        notes = ""
+    """Сохраняет примечание и показывает сводку для подтверждения"""
+    text = update.message.text.strip()
 
-    context.user_data["notes"] = truncate_field(notes, MAX_FIELD_LENGTH)
+    # Проверка на отмену
+    cancel_keywords = ["❌ Отмена", "Отмена", "отмена", "cancel"]
+    if text in cancel_keywords or text.lower() in ["отмена", "cancel"]:
+        user_id = update.effective_user.id
+        context.user_data.clear()
+        clear_conversation_state(user_id)
+        await _safe_reply(
+            update, "❌ Заявка отменена.", reply_markup=get_main_keyboard(user_id)
+        )
+        return ConversationHandler.END
+
+    # Обработка кнопки "Назад"
+    if text == "⬅️ Назад":
+        # Возвращаемся к выбору объекта
+        try:
+            lists = get_all_lists()
+            objects = lists.get("object", ["Солнечное", "Привилегия", "Не указан"])
+        except Exception:
+            objects = ["Солнечное", "Привилегия", "Не указан"]
+
+        cols = int(get_setting("buttons_per_row_object", "2"))
+        keyboard = [objects[i : i + cols] for i in range(0, len(objects), cols)]
+        keyboard.append(["⬅️ Назад", "❌ Отмена"])
+        await _safe_reply(
+            update,
+            "🏗️ <b>Шаг 5/6:</b> Выберите объект:\n\n"
+            f"Текущее значение: <code>{escape(context.user_data.get('object', ''))}</code>",
+            reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True),
+            parse_mode="HTML",
+        )
+        return OBJECT
+
+    if text in ("-", "➡️ Пропустить"):
+        text = ""
+
+    context.user_data["notes"] = truncate_field(text, MAX_FIELD_LENGTH)
     context.user_data["photos"] = []
 
+    # Показываем сводку для подтверждения
+    notes = context.user_data.get("notes", "")
+    photos = context.user_data.get("photos", [])
+    photo_text = f"📎 Фото: {len(photos)} шт." if photos else "📎 Фото: нет"
+
+    summary = (
+        "📋 <b>Проверьте заявку:</b>\n\n"
+        f"📦 Наименование: <b>{escape(context.user_data['name'])}</b>\n"
+        f"🔢 Количество: <code>{escape(context.user_data['quantity'])} {escape(context.user_data['unit'])}</code>\n"
+        f"👤 Инициатор: {escape(context.user_data['initiator'])}\n"
+        f"🏗️ Объект: {escape(context.user_data['object'])}\n"
+        f"📝 Дополнительно: {escape(notes) if notes else '—'}\n"
+        f"{photo_text}\n\n"
+        "Подтвердите или отмените:"
+    )
+
     keyboard = ReplyKeyboardMarkup(
-        [["➡️ Пропустить", "❌ Отмена"]],
+        [["✅ Подтвердить", "📎 Добавить фото"], ["✏️ Исправить", "❌ Отмена"]],
         resize_keyboard=True,
     )
-    _save_draft(update, context)
-    await _safe_reply(
-        update,
-        f"📷 <b>Шаг 7/7:</b> Прикрепите фото (до {MAX_PHOTOS_PER_REQUEST} шт.)\n"
-        "или нажмите <b>➡️ Пропустить</b>:",
-        reply_markup=keyboard,
-        parse_mode="HTML",
-    )
-    return PHOTO
+
+    await _safe_reply(update, summary, reply_markup=keyboard, parse_mode="HTML")
+    return CONFIRM
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -852,13 +1225,13 @@ async def handle_photo_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🔢 Количество: <code>{escape(context.user_data['quantity'])} {escape(context.user_data['unit'])}</code>\n"
         f"👤 Инициатор: {escape(context.user_data['initiator'])}\n"
         f"🏗️ Объект: {escape(context.user_data['object'])}\n"
-        f"📝 Примечание: {escape(notes) if notes else '—'}\n"
+        f"📝 Дополнительно: {escape(notes) if notes else '—'}\n"
         f"{photo_text}\n\n"
         "Подтвердите или отмените:"
     )
 
     keyboard = ReplyKeyboardMarkup(
-        [["✅ Подтвердить", "✏️ Исправить"], ["❌ Отмена"]],
+        [["✅ Подтвердить", "📎 Добавить фото"], ["✏️ Исправить", "❌ Отмена"]],
         resize_keyboard=True,
     )
 
@@ -879,11 +1252,26 @@ async def confirm_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
 
+    if text == "📎 Добавить фото":
+        # Переход к добавлению фото
+        keyboard = ReplyKeyboardMarkup(
+            [["✅ Готово", "❌ Отмена"]],
+            resize_keyboard=True,
+        )
+        await _safe_reply(
+            update,
+            f"📷 Прикрепите фото (до {MAX_PHOTOS_PER_REQUEST} шт.)\n"
+            "или нажмите <b>✅ Готово</b>:",
+            reply_markup=keyboard,
+            parse_mode="HTML",
+        )
+        return PHOTO
+
     if text == "✏️ Исправить":
         # Возврат к шагу NAME с сохранёнными данными
         await _safe_reply(
             update,
-            "✏️ <b>Шаг 1/7:</b> Введите наименование товара/услуги "
+            "✏️ <b>Шаг 1/6:</b> Введите наименование материала или товара "
             f"(текущее: <code>{escape(context.user_data.get('name', ''))}</code>):",
             reply_markup=CANCEL_KEYBOARD,
             parse_mode="HTML",
@@ -895,6 +1283,7 @@ async def confirm_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
             update,
             "⚠️ Используйте кнопки:\n"
             "✅ Подтвердить — сохранить заявку\n"
+            "📎 Добавить фото — прикрепить фото\n"
             "✏️ Исправить — изменить данные\n"
             "❌ Отмена — отменить",
         )
@@ -931,7 +1320,7 @@ async def confirm_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🔢 Количество: {escape(context.user_data['quantity'])} {escape(context.user_data['unit'])}\n"
             f"👤 Инициатор: {escape(context.user_data['initiator'])}\n"
             f"🏗️ Объект: {escape(context.user_data['object'])}\n"
-            f"📝 Примечание: {escape(context.user_data['notes']) if context.user_data['notes'] else '—'}"
+            f"📝 Дополнительно: {escape(context.user_data['notes']) if context.user_data['notes'] else '—'}"
         )
         if photo_text:
             summary += f"\n{photo_text}"
@@ -1047,8 +1436,8 @@ async def analysis_filter_handler(update: Update, context: ContextTypes.DEFAULT_
     await _safe_edit(query, "⏳ Формирую отчёт...")
 
     try:
-        result, ids_with_photos, all_ids = build_report(mode=mode)
-        keyboard = _build_photo_keyboard(ids_with_photos, all_ids)
+        result, ids_with_photos, all_ids, requests_data = build_report(mode=mode)
+        keyboard = _build_photo_keyboard(ids_with_photos, all_ids, requests_data)
         await send_long_message(
             context,
             query.message.chat_id,
@@ -1058,8 +1447,8 @@ async def analysis_filter_handler(update: Update, context: ContextTypes.DEFAULT_
         )
     except Exception as e:
         logger.error(f"Ошибка формирования отчёта: {e}", exc_info=True)
-        await _safe_reply(
-            update, "❌ Ошибка при формировании отчёта. Попробуйте позже."
+        await _safe_edit(
+            query, "❌ Ошибка при формировании отчёта. Попробуйте позже."
         )
 
     return ConversationHandler.END
@@ -1174,12 +1563,39 @@ async def complete_batch_handler(update: Update, context: ContextTypes.DEFAULT_T
         user_name=_user_name(update),
     )
 
+    # Определяем фактически завершённые заявки
+    completed_ids = []
+    for rid in ids:
+        req = get_request_by_id(rid)
+        if req and req.get("done_date"):
+            completed_ids.append(rid)
+
+    completed_text = ", ".join(f"#{i}" for i in completed_ids) if completed_ids else "—"
     await _safe_edit(
         query,
         f"✅ Завершено заявок: <b>{completed}</b>\n"
-        f"Номера: {', '.join(f'#{i}' for i in ids[:completed])}",
+        f"Номера: {completed_text}",
         parse_mode="HTML",
     )
+
+    # Уведомления в общий чат (по фактически завершённым)
+    if completed_ids:
+        notify_text = (
+            f"✅ <b>Массовое завершение: {len(completed_ids)} заявок</b>\n"
+            f"📅 {today.strftime('%d.%m.%Y')}\n"
+            f"📋 Номера: {completed_text}"
+        )
+        try:
+            await _safe_send(
+                context,
+                int(TELEGRAM_CHAT_ID),
+                notify_text,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+        except Exception as e:
+            logger.warning(f"Не удалось отправить уведомление о массовом завершении: {e}")
+
     context.user_data.pop("complete_requests", None)
     return ConversationHandler.END
 
@@ -1344,14 +1760,20 @@ async def complete_confirm_handler(update: Update, context: ContextTypes.DEFAULT
         context.user_data.pop("complete_comment", None)
         return ConversationHandler.END
 
-    qty_text = f"{r['quantity']} {r['unit']}".strip() if r.get("quantity") else "—"
+    # Уведомляем только если заявка была завершена впервые
+    # (result содержит done_date из БД, а не из user_data)
+    result_name = result.get("name", r.get("name", "—"))
+    result_qty = result.get("quantity")
+    result_unit = result.get("unit", "")
+    qty_text = f"{result_qty} {result_unit}".strip() if result_qty else "—"
+    done_str = result.get("done_date", today.isoformat())
     notification = (
         f"✅ <b>Заявка #{r['id']} выполнена</b>\n\n"
-        f"📦 {escape(r['name'])}\n"
+        f"📦 {escape(result_name)}\n"
         f"🔢 {escape(qty_text)}\n"
-        f"👤 {escape(r.get('initiator', '—'))}\n"
-        f"🏗️ {escape(r.get('object', '—'))}\n"
-        f"📅 Выполнено: {today.strftime('%d.%m')}"
+        f"👤 {escape(result.get('initiator', r.get('initiator', '—')))}\n"
+        f"🏗️ {escape(result.get('object', r.get('object', '—')))}\n"
+        f"📅 Выполнено: {done_str}"
     )
     if comment:
         notification += f"\n💬 Комментарий: {escape(comment)}"
@@ -1582,8 +2004,11 @@ async def _show_my_requests_page(update_or_query, context):
     page = context.user_data.get("my_page", 0)
     PAGE_SIZE = 10
     total_pages = max(1, (len(requests) + PAGE_SIZE - 1) // PAGE_SIZE)
-    page = max(0, min(page, total_pages - 1))
-    start = page * PAGE_SIZE
+    clamped_page = max(0, min(page, total_pages - 1))
+    # Сохраняем нормализованную страницу обратно
+    if clamped_page != page:
+        context.user_data["my_page"] = clamped_page
+    start = clamped_page * PAGE_SIZE
     end = start + PAGE_SIZE
     page_requests = requests[start:end]
 
@@ -1677,15 +2102,53 @@ async def my_requests_search_handler(
     return MY_REQUESTS_SELECT
 
 
+_MENU_BUTTONS = {
+    "➕ Добавить заявку",
+    "📋 Мои заявки",
+    "📋 Заявки",
+    "📊 Анализ",
+    "📊 Дашборд",
+    "✅ Завершить заявку",
+    "⚙️ Настройки",
+    "⛔ Выход",
+}
+
+
 async def my_requests_search_text_handler(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ):
     """Обрабатывает текст поиска"""
+    text = update.message.text.strip()
+
+    # Если пользователь нажал кнопку меню — выходим из диалога
+    if text in _MENU_BUTTONS:
+        # Сначала выходим из диалога
+        context.user_data.pop("my_requests", None)
+        context.user_data.pop("my_page", None)
+        context.user_data.pop("awaiting_search", None)
+
+        # Затем обрабатываем кнопку меню
+        if text == "📊 Анализ":
+            return await analysis_start(update, context)
+        elif text == "📊 Дашборд":
+            return await dashboard_start(update, context)
+        else:
+            await _safe_reply(
+                update,
+                "↩️ Вышли из «Моих заявок». Нажмите кнопку ещё раз.",
+                reply_markup=get_main_keyboard(update.effective_user.id),
+            )
+            return ConversationHandler.END
+
     if not context.user_data.get("awaiting_search"):
+        await _safe_reply(
+            update,
+            "📋 Нажмите 🔍 Поиск для ввода запроса, или выберите действие из меню.",
+        )
         return ConversationHandler.END
 
     context.user_data["awaiting_search"] = False
-    query_text = update.message.text.strip()
+    query_text = text
 
     user_id = update.effective_user.id
     linked_name = get_initiator_by_tg_id(user_id)
@@ -1844,27 +2307,25 @@ async def _show_list(
 ):
     """Показывает значения справочника с inline-кнопками"""
     query = update.callback_query
-    lists = get_all_lists()
-    values = lists.get(list_type, [])
+    items = get_list_items(list_type)
     label = LIST_TYPE_LABELS.get(list_type, list_type)
 
     text = f"<b>{label}</b>\n\n"
-    if values:
-        text += "\n".join(f"• {escape(v)}" for v in values)
+    if items:
+        text += "\n".join(f"• {escape(item['value'])}" for item in items)
     else:
         text += "(пусто)"
 
     keyboard = []
-    for v in values:
-        if v == "Другое":
+    for item in items:
+        if item["value"] == "Другое":
             continue
-        safe_v = _truncate_callback_data("rename:", v)
         keyboard.append(
             [
                 InlineKeyboardButton(
-                    f"✏️ {escape(v)}", callback_data=f"rename:{safe_v}"
+                    f"✏️ {escape(item['value'])}", callback_data=f"rename:{item['id']}"
                 ),
-                InlineKeyboardButton(f"🗑", callback_data=f"del:{safe_v}"),
+                InlineKeyboardButton(f"🗑", callback_data=f"del:{item['id']}"),
             ]
         )
     keyboard.append([InlineKeyboardButton("➕ Добавить", callback_data="add")])
@@ -1903,7 +2364,12 @@ async def admin_list_view_handler(update: Update, context: ContextTypes.DEFAULT_
         return ADMIN_ADD_VALUE
 
     if data.startswith("rename:"):
-        old_value = data.split(":", 1)[1]
+        item_id = int(data.split(":", 1)[1])
+        item = get_list_value_by_id(item_id)
+        if not item:
+            await _safe_edit(query, "⚠️ Значение не найдено.")
+            return ADMIN_LIST_VIEW
+        old_value = item["value"]
         context.user_data["admin_rename_old"] = old_value
         await _safe_edit(
             query,
@@ -1913,10 +2379,16 @@ async def admin_list_view_handler(update: Update, context: ContextTypes.DEFAULT_
         return ADMIN_RENAME_NEW
 
     if data.startswith("del:"):
-        value = data.split(":", 1)[1]
+        item_id = int(data.split(":", 1)[1])
+        item = get_list_value_by_id(item_id)
+        if not item:
+            await _safe_edit(query, "⚠️ Значение не найдено.")
+            return ADMIN_LIST_VIEW
+        value = item["value"]
+        context.user_data["admin_delete_value"] = value
         keyboard = [
             [
-                InlineKeyboardButton("✅ Да", callback_data=f"confirm_del:{value}"),
+                InlineKeyboardButton("✅ Да", callback_data=f"confirm_del:{item_id}"),
                 InlineKeyboardButton("❌ Нет", callback_data="back_list"),
             ]
         ]
@@ -1954,9 +2426,21 @@ async def admin_rename_new_handler(update: Update, context: ContextTypes.DEFAULT
     """Сохраняет новое значение после переименования"""
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
-    new_value = truncate_field(update.message.text.strip(), MAX_FIELD_LENGTH)
+    new_value = update.message.text.strip()
     old_value = context.user_data.get("admin_rename_old", "")
     list_type = context.user_data.get("admin_list_type", "object")
+
+    # Проверка на отмену
+    cancel_keywords = ["❌ Отмена", "Отмена", "отмена", "cancel"]
+    if new_value in cancel_keywords or new_value.lower() in ["отмена", "cancel"]:
+        await _safe_reply(
+            update,
+            "❌ Переименование отменено.",
+            reply_markup=get_main_keyboard(update.effective_user.id),
+        )
+        return await _show_list_msg(update, context, list_type)
+
+    new_value = truncate_field(new_value, MAX_FIELD_LENGTH)
 
     if not new_value:
         await _safe_reply(
@@ -1992,16 +2476,21 @@ async def admin_delete_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     list_type = context.user_data.get("admin_list_type", "object")
 
     if data.startswith("confirm_del:"):
-        value = data.split(":", 1)[1]
-        delete_list_value(list_type, value)
-        audit_log(
-            None,
-            update.effective_user.id,
-            _user_name(update),
-            "list_deleted",
-            f"{list_type}: {value}",
-        )
-        await query.answer(f"Удалено: {value}", show_alert=True)
+        item_id = int(data.split(":", 1)[1])
+        item = get_list_value_by_id(item_id)
+        if item:
+            value = item["value"]
+            delete_list_value(list_type, value)
+            audit_log(
+                None,
+                update.effective_user.id,
+                _user_name(update),
+                "list_deleted",
+                f"{list_type}: {value}",
+            )
+            await query.answer(f"Удалено: {value}", show_alert=True)
+        else:
+            await query.answer("⚠️ Значение не найдено.", show_alert=True)
 
     return await _show_list(update, context, list_type)
 
@@ -2010,8 +2499,20 @@ async def admin_add_value_handler(update: Update, context: ContextTypes.DEFAULT_
     """Добавляет новое значение в справочник"""
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
-    new_value = truncate_field(update.message.text.strip(), MAX_FIELD_LENGTH)
+    new_value = update.message.text.strip()
     list_type = context.user_data.get("admin_list_type", "object")
+
+    # Проверка на отмену
+    cancel_keywords = ["❌ Отмена", "Отмена", "отмена", "cancel"]
+    if new_value in cancel_keywords or new_value.lower() in ["отмена", "cancel"]:
+        await _safe_reply(
+            update,
+            "❌ Добавление отменено.",
+            reply_markup=get_main_keyboard(update.effective_user.id),
+        )
+        return await _show_list_msg(update, context, list_type)
+
+    new_value = truncate_field(new_value, MAX_FIELD_LENGTH)
 
     if not new_value:
         await _safe_reply(
@@ -2082,27 +2583,25 @@ async def _show_list_msg(
     update: Update, context: ContextTypes.DEFAULT_TYPE, list_type: str
 ):
     """Показывает справочник через обычное сообщение (не callback)"""
-    lists = get_all_lists()
-    values = lists.get(list_type, [])
+    items = get_list_items(list_type)
     label = LIST_TYPE_LABELS.get(list_type, list_type)
 
     text = f"<b>{label}</b>\n\n"
-    if values:
-        text += "\n".join(f"• {escape(v)}" for v in values)
+    if items:
+        text += "\n".join(f"• {escape(item['value'])}" for item in items)
     else:
         text += "(пусто)"
 
     keyboard = []
-    for v in values:
-        if v == "Другое":
+    for item in items:
+        if item["value"] == "Другое":
             continue
-        safe_v = _truncate_callback_data("rename:", v)
         keyboard.append(
             [
                 InlineKeyboardButton(
-                    f"✏️ {escape(v)}", callback_data=f"rename:{safe_v}"
+                    f"✏️ {escape(item['value'])}", callback_data=f"rename:{item['id']}"
                 ),
-                InlineKeyboardButton(f"🗑", callback_data=f"del:{safe_v}"),
+                InlineKeyboardButton(f"🗑", callback_data=f"del:{item['id']}"),
             ]
         )
     keyboard.append([InlineKeyboardButton("➕ Добавить", callback_data="add")])
@@ -2200,7 +2699,12 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "👋 До встречи! Для возврата введите /start",
             reply_markup=ReplyKeyboardMarkup([["/start"]], resize_keyboard=True),
         )
-
+    elif text == "📊 Анализ":
+        # Перенаправляем на analysis_start
+        return await analysis_start(update, context)
+    elif text == "📊 Дашборд":
+        # Перенаправляем на dashboard_start
+        return await dashboard_start(update, context)
     else:
         await _safe_reply(
             update,
@@ -2214,7 +2718,7 @@ async def dashboard_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает дашборд администратору."""
     if not is_admin(update.effective_user.id):
         await _safe_reply(update, "⛔ У вас нет прав для этой команды.")
-        return
+        return ConversationHandler.END
     text = build_dashboard()
     keyboard = InlineKeyboardMarkup(
         [
@@ -2225,6 +2729,40 @@ async def dashboard_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
     )
     await _safe_reply(update, text, parse_mode="HTML", reply_markup=keyboard)
+    return ConversationHandler.END
+
+
+async def dashboard_reqs_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик кнопки «Все заявки» на дашборде — открывает список заявок."""
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update.effective_user.id):
+        return
+    context.user_data["req_filter"] = None
+    await _show_requests_list(update, context, 0)
+
+
+async def dashboard_report_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик кнопки «Отчёт» на дашборде — генерирует отчёт."""
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update.effective_user.id):
+        return
+    mode = query.data.split(":")[1]
+    await _safe_edit(query, "⏳ Формирую отчёт...")
+    try:
+        result, ids_with_photos, all_ids, requests_data = build_report(mode=mode)
+        keyboard = _build_photo_keyboard(ids_with_photos, all_ids, requests_data)
+        await send_long_message(
+            context,
+            query.message.chat_id,
+            result,
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+    except Exception as e:
+        logger.error(f"Ошибка формирования отчёта из дашборда: {e}", exc_info=True)
+        await _safe_edit(query, "❌ Ошибка при формировании отчёта.")
 
 
 # ===== РАЗДЕЛ «ЗАЯВКИ» =====
@@ -2385,7 +2923,7 @@ async def _render_request_card(query, context, req: dict):
     if req.get("done_date"):
         text += f"\n📅 Выполнено: {escape(req['done_date'])}"
     if notes and notes != "-":
-        text += f"\n📝 Примечание: {escape(notes)}"
+        text += f"\n📝 Дополнительно: {escape(notes)}"
     if photo_text:
         text += photo_text
 
@@ -2402,7 +2940,6 @@ async def _render_request_card(query, context, req: dict):
     )
     buttons.append(
         [
-            InlineKeyboardButton("✏️ Редактировать", callback_data=f"reqe:{req_id}"),
             InlineKeyboardButton("🗑 Удалить", callback_data=f"reqdel:{req_id}"),
         ]
     )
@@ -2506,26 +3043,48 @@ async def requests_card_handler(update: Update, context: ContextTypes.DEFAULT_TY
             await _safe_edit(query, "⚠️ Заявка не найдена.")
             return ConversationHandler.END
         context.user_data["edit_request"] = req
+        context.user_data["edit_fields_order"] = ["name", "quantity", "unit", "object", "notes"]
+        context.user_data["edit_current_index"] = 0
+
+        # Показываем первое поле для редактирования
+        field = "name"
+        field_names = {
+            "name": "наименование",
+            "quantity": "количество",
+            "unit": "единица измерения",
+            "object": "объект",
+            "notes": "примечание",
+        }
+        field_name = field_names.get(field, field)
+        current_value = req.get(field, "")
+
+        # В первом пункте только кнопка "Вперёд"
         keyboard = [
-            [InlineKeyboardButton("📦 Наименование", callback_data="editf:name")],
-            [InlineKeyboardButton("🔢 Количество", callback_data="editf:quantity")],
-            [InlineKeyboardButton("📏 Единица", callback_data="editf:unit")],
-            [InlineKeyboardButton("🏗️ Объект", callback_data="editf:object")],
-            [InlineKeyboardButton("📝 Примечание", callback_data="editf:notes")],
-            [InlineKeyboardButton("❌ Отмена", callback_data="editcancel")],
+            [InlineKeyboardButton("➡️ Вперёд", callback_data="editnext")],
         ]
+
         await _safe_edit(
             query,
             f"✏️ <b>Редактирование заявки #{req_id}</b>\n\n"
-            f"📦 {escape(req.get('name', '—'))}\n"
-            f"🔢 {req.get('quantity', '—')} {req.get('unit', '')}\n"
-            f"🏗️ {escape(req.get('object', '—'))}\n"
-            f"📝 {escape(req.get('notes', '—'))}\n\n"
-            "Выберите поле для редактирования:",
+            f"📦 Наименование: <code>{escape(str(current_value))}</code>\n\n"
+            f"Введите новое значение для <b>{field_name}</b>:",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="HTML",
         )
-        return REQUESTS_CARD
+
+        # Показываем клавиатуру для ввода (только "Вперёд")
+        input_keyboard = ReplyKeyboardMarkup(
+            [["➡️ Вперёд"]], resize_keyboard=True, one_time_keyboard=True
+        )
+        await _safe_send(
+            context,
+            query.message.chat_id,
+            "Или используйте кнопку ниже:",
+            reply_markup=input_keyboard,
+        )
+
+        context.user_data["edit_field"] = field
+        return EDIT_INPUT_VALUE
 
     if data.startswith("editf:"):
         # Выбор поля → запрос нового значения
@@ -2540,22 +3099,46 @@ async def requests_card_handler(update: Update, context: ContextTypes.DEFAULT_TY
             "notes": "примечание",
         }
         field_name = field_names.get(field, field)
+
+        # Получаем текущее значение поля для подсказки
+        req = context.user_data.get("edit_request", {})
+        current_value = req.get(field, "")
+
+        # Обновляем порядок полей и текущий индекс
+        fields_order = ["name", "quantity", "unit", "object", "notes"]
+        context.user_data["edit_fields_order"] = fields_order
+        context.user_data["edit_current_index"] = fields_order.index(field) if field in fields_order else 0
+
+        keyboard = [
+            [InlineKeyboardButton("➡️ Вперёд", callback_data="editnext"),
+             InlineKeyboardButton("✅ Завершить", callback_data="editfinish")],
+        ]
+
         await _safe_edit(
             query,
-            f"✏️ Введите новое значение для <b>{field_name}</b>:",
+            f"✏️ Введите новое значение для <b>{field_name}</b>:\n\n"
+            f"Текущее значение: <code>{escape(str(current_value))}</code>",
+            reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="HTML",
         )
+
+        # Показываем клавиатуру для ввода
+        input_keyboard = ReplyKeyboardMarkup(
+            [["➡️ Вперёд", "✅ Завершить"]], resize_keyboard=True, one_time_keyboard=True
+        )
+        await _safe_send(
+            context,
+            query.message.chat_id,
+            "Или используйте кнопки ниже:",
+            reply_markup=input_keyboard,
+        )
+
         return EDIT_INPUT_VALUE
 
     if data == "editcancel":
+        # Завершаем редактирование (для обратной совместимости)
         await query.answer()
-        context.user_data.pop("edit_request", None)
-        context.user_data.pop("edit_field", None)
-        req = context.user_data.get("card_request")
-        if req:
-            return await _render_request_card(query, context, req)
-        await _safe_edit(query, "❌ Отменено.")
-        return ConversationHandler.END
+        return await _finish_editing(update, context, update.effective_user.id)
 
     if data.startswith("reqdel:"):
         # Удаление — запрос подтверждения
@@ -2614,32 +3197,80 @@ async def requests_card_handler(update: Update, context: ContextTypes.DEFAULT_TY
     return REQUESTS_CARD
 
 
+async def edit_next_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик кнопки 'Вперёд' при редактировании."""
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    req = context.user_data.get("edit_request")
+
+    if not req:
+        await _safe_edit(query, "⚠️ Ошибка: данные не найдены.")
+        return ConversationHandler.END
+
+    return await _move_to_next_field(update, context, user_id, req)
+
+
+async def edit_finish_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик кнопки 'Завершить' при редактировании."""
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+
+    return await _finish_editing(update, context, user_id)
+
+
+async def edit_prev_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик кнопки 'Назад' при редактировании."""
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    req = context.user_data.get("edit_request")
+
+    if not req:
+        await _safe_edit(query, "⚠️ Ошибка: данные не найдены.")
+        return ConversationHandler.END
+
+    return await _move_to_prev_field(update, context, user_id, req)
+
+
 async def edit_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Принимает новое значение поля при редактировании."""
     user_id = update.effective_user.id
     new_value = update.message.text.strip()
     req = context.user_data.get("edit_request")
-    field = context.user_data.pop("edit_field", None)
+    field = context.user_data.get("edit_field")
 
     if not req or not field:
         await _safe_reply(update, "⚠️ Ошибка: данные не найдены.")
         return ConversationHandler.END
 
-    if new_value == "❌ Отмена":
-        context.user_data.pop("edit_request", None)
-        await _safe_reply(
-            update,
-            "❌ Редактирование отменено.",
-            reply_markup=get_main_keyboard(user_id),
-        )
-        return ConversationHandler.END
+    # Проверка на завершение редактирования
+    if new_value in ["✅ Завершить", "Завершить", "завершить", "Готово", "готово"]:
+        return await _finish_editing(update, context, user_id)
+
+    # Проверка на переход к следующему полю без изменений
+    if new_value in ["➡️ Вперёд", "Вперёд", "вперёд", "Далее", "далее"]:
+        return await _move_to_next_field(update, context, user_id, req)
+
+    # Проверка на переход к предыдущему полю
+    if new_value in ["⬅️ Назад", "Назад", "назад"]:
+        return await _move_to_prev_field(update, context, user_id, req)
 
     new_value = truncate_field(new_value, MAX_FIELD_LENGTH)
 
     # Валидация количества
     if field == "quantity":
         if not validate_quantity(new_value):
-            await _safe_reply(update, "❌ Введите число (например, 10 или 5.5):")
+            await _safe_reply(
+                update,
+                "❌ <b>Неверный формат количества</b>\n\n"
+                "Пожалуйста, введите положительное число.\n\n"
+                "✅ <b>Правильные примеры:</b>\n"
+                "• 10\n• 5.5\n• 0.25\n\n"
+                "Или нажмите «➡️ Вперёд» для перехода к следующему полю.",
+                parse_mode="HTML",
+            )
             return EDIT_INPUT_VALUE
         new_value = float(new_value.replace(",", "."))
 
@@ -2657,20 +3288,181 @@ async def edit_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "quantity": "Количество",
             "unit": "Единица",
             "object": "Объект",
-            "notes": "Примечание",
+            "notes": "Дополнительно",
         }
         await _safe_reply(
             update,
             f"✅ {field_names.get(field, field)} обновлено: <b>{escape(str(new_value))}</b>",
+            parse_mode="HTML",
+        )
+
+        # Обновляем данные заявки в контексте
+        updated_req = get_request_by_id(req["id"])
+        if updated_req:
+            context.user_data["edit_request"] = updated_req
+
+        # Переходим к следующему полю
+        return await _move_to_next_field(update, context, user_id, updated_req or req)
+    else:
+        await _safe_reply(
+            update, "❌ Не удалось обновить.", reply_markup=get_main_keyboard(user_id)
+        )
+        context.user_data.pop("edit_request", None)
+        context.user_data.pop("edit_field", None)
+        return ConversationHandler.END
+
+
+async def _move_to_next_field(update, context, user_id, req):
+    """Переходит к следующему полю для редактирования."""
+    fields_order = context.user_data.get("edit_fields_order", ["name", "quantity", "unit", "object", "notes"])
+    current_index = context.user_data.get("edit_current_index", 0)
+
+    # Переходим к следующему полю
+    next_index = current_index + 1
+
+    if next_index >= len(fields_order):
+        # Все поля отредактированы
+        return await _finish_editing(update, context, user_id)
+
+    # Обновляем индекс
+    context.user_data["edit_current_index"] = next_index
+    next_field = fields_order[next_index]
+    context.user_data["edit_field"] = next_field
+
+    field_names = {
+        "name": "наименование",
+        "quantity": "количество",
+        "unit": "единица измерения",
+        "object": "объект",
+        "notes": "примечание",
+    }
+    field_name = field_names.get(next_field, next_field)
+    current_value = req.get(next_field, "")
+
+    # Если это последний пункт, показываем "Завершить" вместо "Вперёд"
+    is_last_field = (next_index == len(fields_order) - 1)
+
+    if is_last_field:
+        keyboard = [
+            [InlineKeyboardButton("⬅️ Назад", callback_data="editprev"),
+             InlineKeyboardButton("✅ Завершить", callback_data="editfinish")],
+        ]
+        input_keyboard = ReplyKeyboardMarkup(
+            [["⬅️ Назад", "✅ Завершить"]], resize_keyboard=True, one_time_keyboard=True
+        )
+    else:
+        keyboard = [
+            [InlineKeyboardButton("⬅️ Назад", callback_data="editprev"),
+             InlineKeyboardButton("➡️ Вперёд", callback_data="editnext")],
+        ]
+        input_keyboard = ReplyKeyboardMarkup(
+            [["⬅️ Назад", "➡️ Вперёд"]], resize_keyboard=True, one_time_keyboard=True
+        )
+
+    await _safe_reply(
+        update,
+        f"✏️ <b>Редактирование заявки #{req['id']}</b>\n\n"
+        f"Текущее значение: <code>{escape(str(current_value))}</code>\n\n"
+        f"Введите новое значение для <b>{field_name}</b>:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="HTML",
+    )
+
+    # Показываем клавиатуру для ввода
+    await _safe_reply(
+        update,
+        "Или используйте кнопки ниже:",
+        reply_markup=input_keyboard,
+    )
+
+    return EDIT_INPUT_VALUE
+
+
+async def _move_to_prev_field(update, context, user_id, req):
+    """Переходит к предыдущему полю для редактирования."""
+    fields_order = context.user_data.get("edit_fields_order", ["name", "quantity", "unit", "object", "notes"])
+    current_index = context.user_data.get("edit_current_index", 0)
+
+    # Переходим к предыдущему полю
+    prev_index = max(0, current_index - 1)
+
+    # Обновляем индекс
+    context.user_data["edit_current_index"] = prev_index
+    prev_field = fields_order[prev_index]
+    context.user_data["edit_field"] = prev_field
+
+    field_names = {
+        "name": "наименование",
+        "quantity": "количество",
+        "unit": "единица измерения",
+        "object": "объект",
+        "notes": "примечание",
+    }
+    field_name = field_names.get(prev_field, prev_field)
+    current_value = req.get(prev_field, "")
+
+    # Если это первый пункт, показываем только "Вперёд"
+    if prev_index == 0:
+        keyboard = [
+            [InlineKeyboardButton("➡️ Вперёд", callback_data="editnext")],
+        ]
+        input_keyboard = ReplyKeyboardMarkup(
+            [["➡️ Вперёд"]], resize_keyboard=True, one_time_keyboard=True
+        )
+    else:
+        keyboard = [
+            [InlineKeyboardButton("⬅️ Назад", callback_data="editprev"),
+             InlineKeyboardButton("➡️ Вперёд", callback_data="editnext")],
+        ]
+        input_keyboard = ReplyKeyboardMarkup(
+            [["⬅️ Назад", "➡️ Вперёд"]], resize_keyboard=True, one_time_keyboard=True
+        )
+
+    await _safe_reply(
+        update,
+        f"✏️ <b>Редактирование заявки #{req['id']}</b>\n\n"
+        f"Текущее значение: <code>{escape(str(current_value))}</code>\n\n"
+        f"Введите новое значение для <b>{field_name}</b>:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="HTML",
+    )
+
+    # Показываем клавиатуру для ввода
+    await _safe_reply(
+        update,
+        "Или используйте кнопки ниже:",
+        reply_markup=input_keyboard,
+    )
+
+    return EDIT_INPUT_VALUE
+
+
+async def _finish_editing(update, context, user_id):
+    """Завершает редактирование заявки."""
+    req = context.user_data.get("edit_request")
+    context.user_data.pop("edit_request", None)
+    context.user_data.pop("edit_field", None)
+    context.user_data.pop("edit_fields_order", None)
+    context.user_data.pop("edit_current_index", None)
+
+    if req:
+        await _safe_reply(
+            update,
+            f"✅ <b>Редактирование заявки #{req['id']} завершено</b>\n\n"
+            f"📦 {escape(req.get('name', '—'))}\n"
+            f"🔢 {escape(str(req.get('quantity', '—')))} {escape(req.get('unit', ''))}\n"
+            f"🏗️ {escape(req.get('object', '—'))}\n"
+            f"📝 {escape(req.get('notes', '—'))}",
             reply_markup=get_main_keyboard(user_id),
             parse_mode="HTML",
         )
     else:
         await _safe_reply(
-            update, "❌ Не удалось обновить.", reply_markup=get_main_keyboard(user_id)
+            update,
+            "✅ Редактирование завершено.",
+            reply_markup=get_main_keyboard(user_id),
         )
 
-    context.user_data.pop("edit_request", None)
     return ConversationHandler.END
 
 
@@ -2711,6 +3503,10 @@ def main():
 
     _validate_config()
     init_db()
+
+    # Подавляем INFO-логи HTTPX/httpcore, чтобы токен не попадал в журналы
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
 
     builder = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN)
     if SOCKS5_PROXY:
@@ -2891,11 +3687,23 @@ def main():
             REQUESTS_CARD: [
                 CallbackQueryHandler(
                     requests_card_handler,
-                    pattern=r"^(reqst|reqssc|reqsscancel|reqe|editf|editcancel|reqdel|reqdelyes|reqdelno|reqback):?.*$",
+                    pattern=r"^(reqst|reqssc|reqsscancel|reqe|editf|editcancel|editnext|editfinish|reqdel|reqdelyes|reqdelno|reqback):?.*$",
                 ),
             ],
             EDIT_INPUT_VALUE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_input_handler)
+                CallbackQueryHandler(
+                    edit_next_handler,
+                    pattern=r"^editnext$",
+                ),
+                CallbackQueryHandler(
+                    edit_finish_handler,
+                    pattern=r"^editfinish$",
+                ),
+                CallbackQueryHandler(
+                    edit_prev_handler,
+                    pattern=r"^editprev$",
+                ),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_input_handler),
             ],
         },
         fallbacks=[
@@ -2925,14 +3733,34 @@ def main():
     app.add_handler(conv_handler)
     app.add_handler(CallbackQueryHandler(show_request_photos, pattern=r"^photos:\d+$"))
     app.add_handler(CallbackQueryHandler(show_request_details, pattern=r"^detail:\d+$"))
+    app.add_handler(
+        CallbackQueryHandler(dashboard_reqs_callback, pattern=r"^reqs:all:\d+$")
+    )
+    app.add_handler(
+        CallbackQueryHandler(dashboard_report_callback, pattern=r"^report:(active|completed)$")
+    )
     app.add_handler(MessageHandler(filters.Regex("^📊 Дашборд$"), dashboard_start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu))
 
+    tz = ZoneInfo(REPORT_TIMEZONE) if REPORT_TIMEZONE else None
+
     app.job_queue.run_daily(
         scheduled_report,
-        time=time(hour=REPORT_HOUR, minute=REPORT_MINUTE),
+        time=time(hour=REPORT_HOUR, minute=REPORT_MINUTE, tzinfo=tz),
         chat_id=int(TELEGRAM_CHAT_ID),
         name="daily_report",
+    )
+
+    # Архивирование старых завершённых заявок (ежедневно в 03:00)
+    async def _archive_job(context):
+        from db import archive_completed_requests
+        count = archive_completed_requests()
+        if count:
+            logger.info(f"Автоматическое архивирование: {count} заявок")
+    app.job_queue.run_daily(
+        _archive_job,
+        time=time(hour=3, minute=0, tzinfo=tz),
+        name="archive_old_requests",
     )
 
     logger.info(

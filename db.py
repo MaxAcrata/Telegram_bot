@@ -1,6 +1,7 @@
 import logging
 import shutil
 import sqlite3
+import uuid
 from datetime import datetime, date
 from pathlib import Path
 from typing import Optional, List, Dict
@@ -67,12 +68,22 @@ CREATE TABLE IF NOT EXISTS conversation_state (
     updated_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS user_input_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    field_type TEXT NOT NULL,
+    value TEXT NOT NULL,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(user_id, field_type, value)
+);
+
 CREATE INDEX IF NOT EXISTS idx_requests_active ON requests(done_date, request_date);
 CREATE INDEX IF NOT EXISTS idx_requests_object ON requests(object);
 CREATE INDEX IF NOT EXISTS idx_requests_status ON requests(status);
 CREATE INDEX IF NOT EXISTS idx_request_photos_req ON request_photos(request_id);
 CREATE INDEX IF NOT EXISTS idx_audit_log_req ON audit_log(request_id);
 CREATE INDEX IF NOT EXISTS idx_audit_log_ts ON audit_log(timestamp);
+CREATE INDEX IF NOT EXISTS idx_user_input_history_user ON user_input_history(user_id, field_type);
 """
 
 # Значения настроек по умолчанию (НЕ перезаписывают существующие)
@@ -228,32 +239,52 @@ def get_audit_log(request_id: Optional[int] = None, limit: int = 50) -> List[dic
 
 def backup_db() -> Optional[str]:
     """Создаёт резервную копию БД через SQLite backup API. Возвращает путь к копии."""
+    source = None
+    dest = None
     try:
         backup_dir = Path(BACKUP_DIR)
         backup_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_path = backup_dir / f"bot_backup_{timestamp}.db"
+        unique_id = uuid.uuid4().hex[:8]
+        backup_path = backup_dir / f"bot_backup_{timestamp}_{unique_id}.db"
 
         source = sqlite3.connect(DB_PATH)
         dest = sqlite3.connect(str(backup_path))
         source.backup(dest)
-        dest.close()
-        source.close()
 
         logger.info(f"Резервная копия создана: {backup_path}")
         return str(backup_path)
     except Exception as e:
         logger.error(f"Ошибка создания резервной копии: {e}")
         return None
+    finally:
+        if dest is not None:
+            try:
+                dest.close()
+            except Exception:
+                pass
+        if source is not None:
+            try:
+                source.close()
+            except Exception:
+                pass
 
 
 def verify_backup(backup_path: str) -> bool:
-    """Проверяет целостность резервной копии."""
+    """Проверяет целостность резервной копии и наличие таблиц приложения."""
     try:
-        conn = sqlite3.connect(backup_path)
+        conn = sqlite3.connect(f"file:{backup_path}?mode=ro", uri=True)
         result = conn.execute("PRAGMA integrity_check").fetchone()
+        if result[0] != "ok":
+            conn.close()
+            return False
+        # Проверяем наличие ключевых таблиц приложения
+        tables = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN "
+            "('requests', 'lists', 'request_photos')"
+        ).fetchall()
         conn.close()
-        return result[0] == "ok"
+        return len(tables) >= 3
     except Exception as e:
         logger.error(f"Ошибка проверки резервной копии: {e}")
         return False
@@ -391,7 +422,7 @@ def update_request_status(
     user_name: str = "",
 ) -> bool:
     """Обновляет статус заявки. Возвращает True если успешно.
-    Использует optimistic locking: UPDATE ... WHERE id=? для атомарности."""
+    Синхронизирует done_date: ставит today при done, очищает при reopen."""
     if new_status not in VALID_STATUSES:
         logger.warning(f"Недопустимый статус: {new_status}")
         return False
@@ -404,10 +435,22 @@ def update_request_status(
         old_status = row["status"]
         if old_status == new_status:
             return True
-        cursor = conn.execute(
-            "UPDATE requests SET status = ? WHERE id = ?",
-            (new_status, request_id),
-        )
+        # Синхронизация done_date с переходами статуса
+        if new_status == "done":
+            cursor = conn.execute(
+                "UPDATE requests SET status = ?, done_date = ? WHERE id = ?",
+                (new_status, date.today().isoformat(), request_id),
+            )
+        elif old_status == "done" and new_status in ("new", "ordered", "delivered"):
+            cursor = conn.execute(
+                "UPDATE requests SET status = ?, done_date = NULL WHERE id = ?",
+                (new_status, request_id),
+            )
+        else:
+            cursor = conn.execute(
+                "UPDATE requests SET status = ? WHERE id = ?",
+                (new_status, request_id),
+            )
         if cursor.rowcount == 0:
             return False
     audit_log(
@@ -460,7 +503,9 @@ def edit_request(
 
     values.append(request_id)
     with get_conn() as conn:
-        conn.execute(f"UPDATE requests SET {', '.join(fields)} WHERE id = ?", values)
+        cursor = conn.execute(f"UPDATE requests SET {', '.join(fields)} WHERE id = ?", values)
+        if cursor.rowcount == 0:
+            return False
     audit_log(request_id, user_id, user_name, "edited", "; ".join(changes))
     return True
 
@@ -543,8 +588,8 @@ def get_dashboard_counts() -> dict:
         overdue = conn.execute("""SELECT COUNT(*) FROM requests
                WHERE done_date IS NULL AND status != 'archived'
                AND status NOT IN ('done', 'delivered')
-               AND request_date < date('now', '-' || (
-                   SELECT COALESCE(value, '3') FROM settings WHERE key = 'overdue_days'
+               AND request_date < date('now', '-' || COALESCE(
+                   (SELECT value FROM settings WHERE key = 'overdue_days'), '3'
                ) || ' days')""").fetchone()[0]
         today_str = date.today().isoformat()
         done_today = conn.execute(
@@ -638,27 +683,66 @@ def add_list_value(list_type: str, value: str) -> bool:
             return False
 
 
+def get_list_items(list_type: str) -> List[dict]:
+    """Возвращает [{id, value, sort_order}] для типа справочника."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT id, value, sort_order FROM lists WHERE list_type = ? ORDER BY sort_order",
+            (list_type,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_list_value_by_id(list_id: int) -> Optional[dict]:
+    """Возвращает {id, list_type, value} по ID или None."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT id, list_type, value FROM lists WHERE id = ?", (list_id,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
 def rename_list_value(list_type: str, old_value: str, new_value: str) -> bool:
-    """Переименовывает значение в справочнике. Возвращает True если успешно."""
+    """Переименовывает значение в справочнике. Для инициаторов также обновляет привязки и заявки."""
     with get_conn() as conn:
         try:
-            conn.execute(
+            cursor = conn.execute(
                 "UPDATE lists SET value = ? WHERE list_type = ? AND value = ?",
                 (new_value, list_type, old_value),
             )
-            return conn.total_changes > 0
+            if cursor.rowcount == 0:
+                return False
+            # Для инициаторов — обновляем привязки и заявки
+            if list_type == "initiator":
+                conn.execute(
+                    "UPDATE initiator_users SET initiator_name = ? WHERE initiator_name = ?",
+                    (new_value, old_value),
+                )
+                conn.execute(
+                    "UPDATE requests SET initiator = ? WHERE initiator = ?",
+                    (new_value, old_value),
+                )
+            return True
         except sqlite3.IntegrityError:
             return False
 
 
 def delete_list_value(list_type: str, value: str) -> bool:
-    """Удаляет значение из справочника. Возвращает True если удалено."""
+    """Удаляет значение из справочника. Для инициаторов также удаляет привязки."""
     with get_conn() as conn:
-        conn.execute(
+        cursor = conn.execute(
             "DELETE FROM lists WHERE list_type = ? AND value = ?",
             (list_type, value),
         )
-        return conn.total_changes > 0
+        if cursor.rowcount == 0:
+            return False
+        # Для инициаторов — удаляем привязку
+        if list_type == "initiator":
+            conn.execute(
+                "DELETE FROM initiator_users WHERE initiator_name = ?",
+                (value,),
+            )
+        return True
 
 
 def get_setting(key: str, default: str = "") -> str:
@@ -700,12 +784,19 @@ def complete_request(
         # Идемпотентность: не перезаписываем, если уже завершена
         if row["done_date"]:
             return result
-        conn.execute(
-            "UPDATE requests SET done_date = ?, status = 'done' WHERE id = ?",
+        cursor = conn.execute(
+            "UPDATE requests SET done_date = ?, status = 'done' "
+            "WHERE id = ? AND done_date IS NULL",
             (done_date.isoformat(), request_id),
         )
-    result["done_date"] = done_date.isoformat()
-    result["status"] = "done"
+        if cursor.rowcount == 0:
+            # Другой writer уже завершил — перечитываем
+            row = conn.execute(
+                "SELECT * FROM requests WHERE id = ?", (request_id,)
+            ).fetchone()
+            return dict(row) if row else result
+        result["done_date"] = done_date.isoformat()
+        result["status"] = "done"
     logger.info(f"Заявка #{request_id} завершена")
     audit_log(
         request_id, user_id, user_name, "completed", f"Дата: {done_date.isoformat()}"
@@ -962,3 +1053,57 @@ def get_all_initiator_links() -> Dict[str, int]:
             "SELECT initiator_name, telegram_id FROM initiator_users"
         ).fetchall()
     return {row["initiator_name"]: row["telegram_id"] for row in rows}
+
+
+# ===== История ввода пользователя =====
+
+
+def save_user_input(user_id: int, field_type: str, value: str):
+    """Сохраняет значение в историю ввода пользователя."""
+    if not value or not value.strip():
+        return
+    try:
+        with get_conn() as conn:
+            conn.execute(
+                """INSERT INTO user_input_history (user_id, field_type, value)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(user_id, field_type, value) DO UPDATE SET created_at = CURRENT_TIMESTAMP""",
+                (user_id, field_type, value.strip()),
+            )
+    except Exception as e:
+        logger.warning(f"save_user_input ошибка: {e}")
+
+
+def get_user_input_history(user_id: int, field_type: str, limit: int = 5) -> List[str]:
+    """Возвращает последние значения из истории ввода пользователя."""
+    try:
+        with get_conn() as conn:
+            rows = conn.execute(
+                """SELECT value FROM user_input_history
+                   WHERE user_id = ? AND field_type = ?
+                   ORDER BY created_at DESC
+                   LIMIT ?""",
+                (user_id, field_type, limit),
+            ).fetchall()
+        return [row["value"] for row in rows]
+    except Exception as e:
+        logger.warning(f"get_user_input_history ошибка: {e}")
+        return []
+
+
+def get_popular_inputs(field_type: str, limit: int = 5) -> List[str]:
+    """Возвращает популярные значения для типа поля."""
+    try:
+        with get_conn() as conn:
+            rows = conn.execute(
+                """SELECT value, COUNT(*) as cnt FROM user_input_history
+                   WHERE field_type = ?
+                   GROUP BY value
+                   ORDER BY cnt DESC
+                   LIMIT ?""",
+                (field_type, limit),
+            ).fetchall()
+        return [row["value"] for row in rows]
+    except Exception as e:
+        logger.warning(f"get_popular_inputs ошибка: {e}")
+        return []

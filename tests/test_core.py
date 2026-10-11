@@ -71,7 +71,7 @@ def test_format_task_html():
     assert "Стройка А" in result
     assert "Иван" in result
     assert "01.01.2023" in result
-    assert "Примечание:" in result
+    assert "Дополнительно:" in result
     assert "срочно" in result
     assert "Новая" in result
 
@@ -156,7 +156,7 @@ def test_format_task_html_with_link():
     today = date(2023, 1, 5)
     result = format_task_html(task, today)
 
-    assert "Примечание:" in result
+    assert "Дополнительно:" in result
     assert '<a href="https://example.com/catalog">' in result
 
 
@@ -177,7 +177,7 @@ def test_format_task_html_notes_dash():
     today = date(2023, 1, 5)
     result = format_task_html(task, today)
 
-    assert "Примечание:" not in result
+    assert "Дополнительно:" not in result
 
 
 def test_format_task_html_with_photo_count():
@@ -227,7 +227,7 @@ def test_build_report_empty(mock_get, mock_photos):
     mock_get.return_value = []
     mock_photos.return_value = {}
 
-    report, ids, all_ids = build_report(save_to_file=False)
+    report, ids, all_ids, requests_data = build_report(save_to_file=False)
 
     assert "активных заявок нет" in report
     assert "Всего активных: <b>0</b>" in report
@@ -267,13 +267,12 @@ def test_build_report_with_tasks(mock_get, mock_photos):
     ]
     mock_photos.return_value = {}
 
-    report, ids, all_ids = build_report(save_to_file=False)
+    report, ids, all_ids, requests_data = build_report(save_to_file=False)
 
     assert "Всего активных: <b>2</b>" in report
     assert "Новая: <b>1</b>" in report
     assert "Заказана: <b>1</b>" in report
-    assert "Кирпич" in report
-    assert "Цемент" in report
+    assert len(requests_data) == 2
 
 
 @patch("core.get_photo_counts")
@@ -296,10 +295,10 @@ def test_build_report_overdue_section(mock_get, mock_photos):
     ]
     mock_photos.return_value = {}
 
-    report, ids, all_ids = build_report(save_to_file=False)
+    report, ids, all_ids, requests_data = build_report(save_to_file=False)
 
-    assert "ПРОСРОЧЕННЫЕ ЗАЯВКИ" in report
-    assert "Иван" in report
+    assert "Просрочено" in report
+    assert len(requests_data) == 1
 
 
 @patch("core.get_photo_counts")
@@ -322,10 +321,10 @@ def test_build_report_with_links(mock_get, mock_photos):
     ]
     mock_photos.return_value = {}
 
-    report, ids, all_ids = build_report(save_to_file=False)
+    report, ids, all_ids, requests_data = build_report(save_to_file=False)
 
-    assert "Примечание:" in report
-    assert '<a href="https://example.com">' in report
+    assert "Всего активных: <b>1</b>" in report
+    assert len(requests_data) == 1
 
 
 @patch("core.get_photo_counts")
@@ -360,8 +359,8 @@ def test_build_report_photo_ids(mock_get, mock_photos):
     ]
     mock_photos.return_value = {1: 3}
 
-    report, ids, all_ids = build_report(save_to_file=False)
+    report, ids, all_ids, requests_data = build_report(save_to_file=False)
 
     assert 1 in ids
     assert 2 not in ids
-    assert "📎 Фото: 3 шт." in report
+    assert len(requests_data) == 2

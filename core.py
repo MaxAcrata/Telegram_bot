@@ -15,10 +15,25 @@ from db import (
 logger = logging.getLogger(__name__)
 
 # Регулярное выражение для поиска URLs
+# Поддерживает сбалансированные скобки в URL (например Wikipedia: /Material_(steel))
 _URL_PATTERN = re.compile(
-    r'https?://[^\s<>"\')\]]+|'  # http:// или https://
-    r'www\.[^\s<>"\')\]]+'  # www.
+    r'https?://[^\s<>"]+|'  # http:// или https://
+    r'www\.[^\s<>"]+'  # www.
 )
+
+
+def _trim_url_punctuation(url: str) -> str:
+    """Убирает конечную пунктуацию, но сохраняет сбалансированные скобки."""
+    # Сначала убираем конечные запятые/точки/точки с запятой
+    while url and url[-1] in ",.;:!?)":
+        # Проверяем, сбалансированы ли скобки после удаления
+        stripped = url.rstrip(url[-1])
+        if url[-1] == ")" and "(" in stripped:
+            # Скобки могут быть частью URL — проверяем баланс
+            if stripped.count("(") >= stripped.count(")"):
+                break
+        url = stripped
+    return url
 
 # Эмодзи для статусов
 _STATUS_EMOJI = {
@@ -43,6 +58,10 @@ def make_links_clickable(text: str) -> str:
     for match in _URL_PATTERN.finditer(text):
         start, end = match.span()
         url = match.group(0)
+
+        # Убираем конечную пунктуацию, сохраняя сбалансированные скобки
+        url = _trim_url_punctuation(url)
+        end = start + len(url)
 
         # Экранируем текст до ссылки
         if start > last_end:
@@ -105,32 +124,33 @@ def format_task_html(task: dict, today: date, photo_count: int = 0) -> str:
     # Добавляем примечание, если оно есть
     if notes_raw and notes_raw != "-":
         notes_html = make_links_clickable(notes_raw)
-        lines.append(f"   └ Примечание: {notes_html}")
+        lines.append(f"   └ Дополнительно: {notes_html}")
 
     if photo_count:
         lines.append(f"   └ 📎 Фото: {photo_count} шт.")
 
     if is_overdue and task_status not in ("done", "delivered"):
-        lines.append(f"   └ ⚠️ Просрочено на {days_elapsed} дн.")
+        overdue_days = days_elapsed - OVERDUE_DAYS
+        lines.append(f"   └ ⚠️ Просрочено на {overdue_days} дн. (возраст: {days_elapsed} дн.)")
 
     return "\n".join(lines)
 
 
 def build_report(save_to_file: bool = True, mode: str = "active") -> tuple:
     """Генерирует HTML-отчёт. mode: 'active' или 'completed'.
-    Возвращает (text, ids_with_photos, all_request_ids)."""
+    Возвращает (text, ids_with_photos, all_request_ids, requests_data)."""
     today = date.today()
 
     if mode == "completed":
-        text, ids, all_ids = _build_completed_report(today, save_to_file)
+        text, ids, all_ids, requests_data = _build_completed_report(today, save_to_file)
     else:
-        text, ids, all_ids = _build_active_report(today, save_to_file)
+        text, ids, all_ids, requests_data = _build_active_report(today, save_to_file)
 
-    return text, ids, all_ids
+    return text, ids, all_ids, requests_data
 
 
 def _build_completed_report(today: date, save_to_file: bool) -> tuple:
-    """Отчёт по выполненным заявкам. Возвращает (text, ids_with_photos, all_ids)."""
+    """Отчёт по выполненным заявкам. Возвращает (text, ids_with_photos, all_ids, requests_data)."""
     tasks = get_completed_requests()
 
     report = [
@@ -145,7 +165,7 @@ def _build_completed_report(today: date, save_to_file: bool) -> tuple:
         result = "\n".join(report)
         if save_to_file:
             _save_report(result)
-        return result, [], []
+        return result, [], [], []
 
     # Получаем количество фото для всех заявок
     task_ids = [t["id"] for t in tasks]
@@ -178,7 +198,7 @@ def _build_completed_report(today: date, save_to_file: bool) -> tuple:
         # Добавляем примечание, если оно есть
         if notes_raw and notes_raw != "-":
             notes_html = make_links_clickable(notes_raw)
-            report.append(f"   └ Примечание: {notes_html}")
+            report.append(f"   └ Дополнительно: {notes_html}")
 
         # Добавляем количество фото
         pc = photo_counts.get(task["id"], 0)
@@ -190,11 +210,11 @@ def _build_completed_report(today: date, save_to_file: bool) -> tuple:
     result = "\n".join(report)
     if save_to_file:
         _save_report(result)
-    return result, ids_with_photos, all_ids
+    return result, ids_with_photos, all_ids, tasks
 
 
 def _build_active_report(today: date, save_to_file: bool) -> tuple:
-    """Отчёт по активным заявкам. Возвращает (text, ids_with_photos, all_ids)."""
+    """Отчёт по активным заявкам. Возвращает (text, ids_with_photos, all_ids, requests_data)."""
     active_tasks = get_active_requests()
 
     report = [
@@ -209,7 +229,7 @@ def _build_active_report(today: date, save_to_file: bool) -> tuple:
         result = "\n".join(report)
         if save_to_file:
             _save_report(result)
-        return result, [], []
+        return result, [], [], []
 
     # Статистика по явным статусам
     by_status = {}
@@ -245,60 +265,10 @@ def _build_active_report(today: date, save_to_file: bool) -> tuple:
     ids_with_photos = [rid for rid, cnt in photo_counts.items() if cnt > 0]
     all_ids = [t["id"] for t in active_tasks]
 
-    # Группировка по объектам
-    from itertools import groupby
-
-    sorted_tasks = sorted(active_tasks, key=lambda t: t.get("object", ""))
-    for obj, group_iter in groupby(sorted_tasks, key=lambda t: t.get("object", "")):
-        group = list(group_iter)
-        report.append(f"\n<b>🏗️ Объект: {escape(obj)}</b>")
-        for task in group:
-            pc = photo_counts.get(task["id"], 0)
-            report.append(format_task_html(task, today, photo_count=pc))
-        report.append("")
-
-    # Раздел просроченных заявок по инициаторам
-    if overdue:
-        report.extend(
-            [
-                "",
-                "<b>⚠️ ПРОСРОЧЕННЫЕ ЗАЯВКИ</b>",
-                "━━━━━━━━━━━━━━━━━━━━",
-            ]
-        )
-        sorted_overdue = sorted(overdue, key=lambda t: t.get("initiator", ""))
-        for initiator, group_iter in groupby(
-            sorted_overdue, key=lambda t: t.get("initiator", "")
-        ):
-            group = list(group_iter)
-            report.append(f"\n👤 <b>{escape(initiator)}</b> — {len(group)} шт.")
-            for task in group:
-                name = escape(task.get("name", "—"))
-                obj = escape(task.get("object", "—"))
-                notes_raw = task.get("notes") or ""
-                req_date_str = task.get("request_date", "")
-                try:
-                    req_date = (
-                        date.fromisoformat(req_date_str) if req_date_str else None
-                    )
-                except (ValueError, TypeError):
-                    req_date = None
-                days = (today - req_date).days if req_date else 0
-                pc = photo_counts.get(task["id"], 0)
-                photo_label = f" 📎{pc}" if pc else ""
-                task_id = task.get("id", "?")
-                report.append(
-                    f"    • #{task_id} {name} ({obj}) — {days} дн.{photo_label}"
-                )
-                if notes_raw and notes_raw != "-":
-                    notes_html = make_links_clickable(notes_raw)
-                    report.append(f"      Примечание: {notes_html}")
-
     result = "\n".join(report)
     if save_to_file:
         _save_report(result)
-    logger.info("Отчёт сформирован")
-    return result, ids_with_photos, all_ids
+    return result, ids_with_photos, all_ids, active_tasks
 
 
 def build_dashboard() -> str:
