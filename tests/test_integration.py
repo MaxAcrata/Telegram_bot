@@ -132,14 +132,9 @@ async def test_full_create_request_flow(
     result = await set_object(u, ctx)
     assert result == NOTES
 
-    # Шаг 6: Примечание
+    # Шаг 6: Дополнительно
     u = make_update(text="Для фасада")
     result = await set_notes_and_save(u, ctx)
-    assert result == PHOTO
-
-    # Шаг 7: Пропустить фото
-    u = make_update(text="➡️ Пропустить")
-    result = await handle_photo_done(u, ctx)
     assert result == CONFIRM
 
     # Подтверждение
@@ -192,7 +187,7 @@ async def test_create_request_with_photos(
     # Шаг 6: Пропустить примечание
     u = make_update(text="➡️ Пропустить")
     result = await set_notes_and_save(u, ctx)
-    assert result == PHOTO
+    assert result == CONFIRM
 
     # Шаг 7a: Первое фото
     u = make_update()

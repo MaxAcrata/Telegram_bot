@@ -63,6 +63,18 @@ def _validate_config():
             f"MAX_PHOTOS_PER_REQUEST={MAX_PHOTOS_PER_REQUEST} — допустимый диапазон 1..10"
         )
 
+    # RATE_LIMIT_REQUESTS: >= 1
+    if RATE_LIMIT_REQUESTS < 1:
+        errors.append(f"RATE_LIMIT_REQUESTS={RATE_LIMIT_REQUESTS} — должно быть >= 1")
+
+    # RATE_LIMIT_WINDOW_SEC: >= 1
+    if RATE_LIMIT_WINDOW_SEC < 1:
+        errors.append(f"RATE_LIMIT_WINDOW_SEC={RATE_LIMIT_WINDOW_SEC} — должно быть >= 1")
+
+    # MAX_FIELD_LENGTH: >= 1
+    if MAX_FIELD_LENGTH < 1:
+        errors.append(f"MAX_FIELD_LENGTH={MAX_FIELD_LENGTH} — должно быть >= 1")
+
     if errors:
         for e in errors:
             print(f"❌ Ошибка конфигурации: {e}", file=sys.stderr)
@@ -100,6 +112,9 @@ REPORT_FILE_NAME = "report.txt"
 
 # ===== PROXY =====
 SOCKS5_PROXY = os.getenv("SOCKS5_PROXY", "")
+
+# ===== TIMEZONE =====
+REPORT_TIMEZONE = os.getenv("REPORT_TIMEZONE", "")
 
 # ===== OTHER =====
 MAX_MESSAGE_LENGTH = 4000
