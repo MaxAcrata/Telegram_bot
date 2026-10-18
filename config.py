@@ -101,10 +101,20 @@ for _x in ADMIN_IDS_RAW.split(","):
             )
 
 # ===== DATABASE =====
-# По умолчанию bot.db рядом с bot.py (для локального запуска).
-# Облачный деплой переопределяет через DB_PATH=/data/bot.db в .env.
-_DEFAULT_DB = str(Path(__file__).resolve().parent / "bot.db")
-DB_PATH = os.getenv("DB_PATH", _DEFAULT_DB)
+# Amvera монтирует persistence в /data — храним БД там, чтобы данные
+# переживали редеплой. Локально (когда /data нет) — bot.db рядом с bot.py.
+# Явный DB_PATH в окружении имеет приоритет.
+_LOCAL_DB = str(Path(__file__).resolve().parent / "bot.db")
+_CLOUD_DATA = Path("/data")
+
+
+def _default_db_path() -> str:
+    if _CLOUD_DATA.is_dir() and os.access(_CLOUD_DATA, os.W_OK):
+        return str(_CLOUD_DATA / "bot.db")
+    return _LOCAL_DB
+
+
+DB_PATH = os.getenv("DB_PATH", _default_db_path())
 
 # ===== REPORTS =====
 OVERDUE_DAYS = int(os.getenv("OVERDUE_DAYS", 3))
@@ -128,7 +138,15 @@ MAX_FIELD_LENGTH = int(os.getenv("MAX_FIELD_LENGTH", "500"))
 MAX_PHOTOS_PER_REQUEST = int(os.getenv("MAX_PHOTOS_PER_REQUEST", "5"))
 
 # ===== BACKUP =====
-BACKUP_DIR = os.getenv("BACKUP_DIR", str(Path(__file__).resolve().parent / "backups"))
+
+
+def _default_backup_dir() -> str:
+    if _CLOUD_DATA.is_dir() and os.access(_CLOUD_DATA, os.W_OK):
+        return str(_CLOUD_DATA / "backups")
+    return str(Path(__file__).resolve().parent / "backups")
+
+
+BACKUP_DIR = os.getenv("BACKUP_DIR", _default_backup_dir())
 
 # Валидация вызывается явно из bot.py main() — не при импорте,
 # чтобы тесты могли импортировать config без .env.
