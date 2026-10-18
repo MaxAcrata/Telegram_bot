@@ -503,7 +503,9 @@ def edit_request(
 
     values.append(request_id)
     with get_conn() as conn:
-        cursor = conn.execute(f"UPDATE requests SET {', '.join(fields)} WHERE id = ?", values)
+        cursor = conn.execute(
+            f"UPDATE requests SET {', '.join(fields)} WHERE id = ?", values
+        )
         if cursor.rowcount == 0:
             return False
     audit_log(request_id, user_id, user_name, "edited", "; ".join(changes))

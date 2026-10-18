@@ -69,7 +69,9 @@ def _validate_config():
 
     # RATE_LIMIT_WINDOW_SEC: >= 1
     if RATE_LIMIT_WINDOW_SEC < 1:
-        errors.append(f"RATE_LIMIT_WINDOW_SEC={RATE_LIMIT_WINDOW_SEC} — должно быть >= 1")
+        errors.append(
+            f"RATE_LIMIT_WINDOW_SEC={RATE_LIMIT_WINDOW_SEC} — должно быть >= 1"
+        )
 
     # MAX_FIELD_LENGTH: >= 1
     if MAX_FIELD_LENGTH < 1:

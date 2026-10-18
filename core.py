@@ -35,6 +35,7 @@ def _trim_url_punctuation(url: str) -> str:
         url = stripped
     return url
 
+
 # Эмодзи для статусов
 _STATUS_EMOJI = {
     "new": "⚪",
@@ -131,7 +132,9 @@ def format_task_html(task: dict, today: date, photo_count: int = 0) -> str:
 
     if is_overdue and task_status not in ("done", "delivered"):
         overdue_days = days_elapsed - OVERDUE_DAYS
-        lines.append(f"   └ ⚠️ Просрочено на {overdue_days} дн. (возраст: {days_elapsed} дн.)")
+        lines.append(
+            f"   └ ⚠️ Просрочено на {overdue_days} дн. (возраст: {days_elapsed} дн.)"
+        )
 
     return "\n".join(lines)
 

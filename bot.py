@@ -222,7 +222,11 @@ async def _safe_callback_reply(update, text, **kwargs):
     """Отправляет ответ в контексте callback (без update.message)."""
     try:
         chat_id = None
-        if hasattr(update, "callback_query") and update.callback_query and update.callback_query.message:
+        if (
+            hasattr(update, "callback_query")
+            and update.callback_query
+            and update.callback_query.message
+        ):
             chat_id = update.callback_query.message.chat_id
         elif hasattr(update, "effective_chat") and update.effective_chat:
             chat_id = update.effective_chat.id
@@ -376,9 +380,7 @@ async def show_request_photos(update: Update, context: ContextTypes.DEFAULT_TYPE
     file_ids = get_request_photos(req_id)
 
     if not file_ids:
-        await _safe_send(
-            context, query.message.chat_id, "📷 Фото не найдены."
-        )
+        await _safe_send(context, query.message.chat_id, "📷 Фото не найдены.")
         return
 
     for file_id in file_ids:
@@ -674,7 +676,9 @@ async def start_add_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     summary_parts.append(
                         f"🔢 {saved_data['quantity']} {saved_data.get('unit', '')}"
                     )
-                summary = "\n".join(summary_parts) if summary_parts else "(пустой черновик)"
+                summary = (
+                    "\n".join(summary_parts) if summary_parts else "(пустой черновик)"
+                )
                 await _safe_reply(
                     update,
                     f"📋 Найден незавершённый черновик:\n\n{summary}\n\n"
@@ -751,7 +755,9 @@ async def set_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return NAME
         # Черновик пуст — новая заявка
         context.user_data.clear()
-        context.user_data["draft_id"] = f"{update.effective_user.id}_{datetime.now().timestamp()}"
+        context.user_data["draft_id"] = (
+            f"{update.effective_user.id}_{datetime.now().timestamp()}"
+        )
         await _safe_reply(
             update,
             "📦 <b>Шаг 1/6:</b> Введите наименование материала или товара:",
@@ -763,7 +769,9 @@ async def set_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == "🔄 Новая заявка":
         context.user_data.clear()
         clear_conversation_state(update.effective_user.id)
-        context.user_data["draft_id"] = f"{update.effective_user.id}_{datetime.now().timestamp()}"
+        context.user_data["draft_id"] = (
+            f"{update.effective_user.id}_{datetime.now().timestamp()}"
+        )
         await _safe_reply(
             update,
             "📦 <b>Шаг 1/6:</b> Введите наименование материала или товара:",
@@ -956,7 +964,9 @@ async def set_initiator(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Возвращаемся к выбору единицы измерения
         try:
             lists = get_all_lists()
-            units = lists.get("unit", ["шт", "кг", "л", "м2", "м3", "лист", "м.п.", "комп"])
+            units = lists.get(
+                "unit", ["шт", "кг", "л", "м2", "м3", "лист", "м.п.", "комп"]
+            )
         except Exception:
             units = ["шт", "кг", "л", "м2", "м3", "лист", "м.п.", "комп"]
 
@@ -1447,9 +1457,7 @@ async def analysis_filter_handler(update: Update, context: ContextTypes.DEFAULT_
         )
     except Exception as e:
         logger.error(f"Ошибка формирования отчёта: {e}", exc_info=True)
-        await _safe_edit(
-            query, "❌ Ошибка при формировании отчёта. Попробуйте позже."
-        )
+        await _safe_edit(query, "❌ Ошибка при формировании отчёта. Попробуйте позже.")
 
     return ConversationHandler.END
 
@@ -1573,8 +1581,7 @@ async def complete_batch_handler(update: Update, context: ContextTypes.DEFAULT_T
     completed_text = ", ".join(f"#{i}" for i in completed_ids) if completed_ids else "—"
     await _safe_edit(
         query,
-        f"✅ Завершено заявок: <b>{completed}</b>\n"
-        f"Номера: {completed_text}",
+        f"✅ Завершено заявок: <b>{completed}</b>\n" f"Номера: {completed_text}",
         parse_mode="HTML",
     )
 
@@ -1594,7 +1601,9 @@ async def complete_batch_handler(update: Update, context: ContextTypes.DEFAULT_T
                 disable_web_page_preview=True,
             )
         except Exception as e:
-            logger.warning(f"Не удалось отправить уведомление о массовом завершении: {e}")
+            logger.warning(
+                f"Не удалось отправить уведомление о массовом завершении: {e}"
+            )
 
     context.user_data.pop("complete_requests", None)
     return ConversationHandler.END
@@ -3043,7 +3052,13 @@ async def requests_card_handler(update: Update, context: ContextTypes.DEFAULT_TY
             await _safe_edit(query, "⚠️ Заявка не найдена.")
             return ConversationHandler.END
         context.user_data["edit_request"] = req
-        context.user_data["edit_fields_order"] = ["name", "quantity", "unit", "object", "notes"]
+        context.user_data["edit_fields_order"] = [
+            "name",
+            "quantity",
+            "unit",
+            "object",
+            "notes",
+        ]
         context.user_data["edit_current_index"] = 0
 
         # Показываем первое поле для редактирования
@@ -3107,11 +3122,15 @@ async def requests_card_handler(update: Update, context: ContextTypes.DEFAULT_TY
         # Обновляем порядок полей и текущий индекс
         fields_order = ["name", "quantity", "unit", "object", "notes"]
         context.user_data["edit_fields_order"] = fields_order
-        context.user_data["edit_current_index"] = fields_order.index(field) if field in fields_order else 0
+        context.user_data["edit_current_index"] = (
+            fields_order.index(field) if field in fields_order else 0
+        )
 
         keyboard = [
-            [InlineKeyboardButton("➡️ Вперёд", callback_data="editnext"),
-             InlineKeyboardButton("✅ Завершить", callback_data="editfinish")],
+            [
+                InlineKeyboardButton("➡️ Вперёд", callback_data="editnext"),
+                InlineKeyboardButton("✅ Завершить", callback_data="editfinish"),
+            ],
         ]
 
         await _safe_edit(
@@ -3124,7 +3143,9 @@ async def requests_card_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
         # Показываем клавиатуру для ввода
         input_keyboard = ReplyKeyboardMarkup(
-            [["➡️ Вперёд", "✅ Завершить"]], resize_keyboard=True, one_time_keyboard=True
+            [["➡️ Вперёд", "✅ Завершить"]],
+            resize_keyboard=True,
+            one_time_keyboard=True,
         )
         await _safe_send(
             context,
@@ -3314,7 +3335,9 @@ async def edit_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def _move_to_next_field(update, context, user_id, req):
     """Переходит к следующему полю для редактирования."""
-    fields_order = context.user_data.get("edit_fields_order", ["name", "quantity", "unit", "object", "notes"])
+    fields_order = context.user_data.get(
+        "edit_fields_order", ["name", "quantity", "unit", "object", "notes"]
+    )
     current_index = context.user_data.get("edit_current_index", 0)
 
     # Переходим к следующему полю
@@ -3340,20 +3363,24 @@ async def _move_to_next_field(update, context, user_id, req):
     current_value = req.get(next_field, "")
 
     # Если это последний пункт, показываем "Завершить" вместо "Вперёд"
-    is_last_field = (next_index == len(fields_order) - 1)
+    is_last_field = next_index == len(fields_order) - 1
 
     if is_last_field:
         keyboard = [
-            [InlineKeyboardButton("⬅️ Назад", callback_data="editprev"),
-             InlineKeyboardButton("✅ Завершить", callback_data="editfinish")],
+            [
+                InlineKeyboardButton("⬅️ Назад", callback_data="editprev"),
+                InlineKeyboardButton("✅ Завершить", callback_data="editfinish"),
+            ],
         ]
         input_keyboard = ReplyKeyboardMarkup(
             [["⬅️ Назад", "✅ Завершить"]], resize_keyboard=True, one_time_keyboard=True
         )
     else:
         keyboard = [
-            [InlineKeyboardButton("⬅️ Назад", callback_data="editprev"),
-             InlineKeyboardButton("➡️ Вперёд", callback_data="editnext")],
+            [
+                InlineKeyboardButton("⬅️ Назад", callback_data="editprev"),
+                InlineKeyboardButton("➡️ Вперёд", callback_data="editnext"),
+            ],
         ]
         input_keyboard = ReplyKeyboardMarkup(
             [["⬅️ Назад", "➡️ Вперёд"]], resize_keyboard=True, one_time_keyboard=True
@@ -3380,7 +3407,9 @@ async def _move_to_next_field(update, context, user_id, req):
 
 async def _move_to_prev_field(update, context, user_id, req):
     """Переходит к предыдущему полю для редактирования."""
-    fields_order = context.user_data.get("edit_fields_order", ["name", "quantity", "unit", "object", "notes"])
+    fields_order = context.user_data.get(
+        "edit_fields_order", ["name", "quantity", "unit", "object", "notes"]
+    )
     current_index = context.user_data.get("edit_current_index", 0)
 
     # Переходим к предыдущему полю
@@ -3411,8 +3440,10 @@ async def _move_to_prev_field(update, context, user_id, req):
         )
     else:
         keyboard = [
-            [InlineKeyboardButton("⬅️ Назад", callback_data="editprev"),
-             InlineKeyboardButton("➡️ Вперёд", callback_data="editnext")],
+            [
+                InlineKeyboardButton("⬅️ Назад", callback_data="editprev"),
+                InlineKeyboardButton("➡️ Вперёд", callback_data="editnext"),
+            ],
         ]
         input_keyboard = ReplyKeyboardMarkup(
             [["⬅️ Назад", "➡️ Вперёд"]], resize_keyboard=True, one_time_keyboard=True
@@ -3737,7 +3768,9 @@ def main():
         CallbackQueryHandler(dashboard_reqs_callback, pattern=r"^reqs:all:\d+$")
     )
     app.add_handler(
-        CallbackQueryHandler(dashboard_report_callback, pattern=r"^report:(active|completed)$")
+        CallbackQueryHandler(
+            dashboard_report_callback, pattern=r"^report:(active|completed)$"
+        )
     )
     app.add_handler(MessageHandler(filters.Regex("^📊 Дашборд$"), dashboard_start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu))
@@ -3754,9 +3787,11 @@ def main():
     # Архивирование старых завершённых заявок (ежедневно в 03:00)
     async def _archive_job(context):
         from db import archive_completed_requests
+
         count = archive_completed_requests()
         if count:
             logger.info(f"Автоматическое архивирование: {count} заявок")
+
     app.job_queue.run_daily(
         _archive_job,
         time=time(hour=3, minute=0, tzinfo=tz),
