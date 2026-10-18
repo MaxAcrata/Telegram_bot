@@ -80,7 +80,13 @@ from db import (
     STATUS_LABELS,
     save_user_input,
 )
-from utils import validate_quantity, split_message, RateLimiter, truncate_field
+from utils import (
+    validate_quantity,
+    split_message,
+    RateLimiter,
+    truncate_field,
+    is_meaningful_text,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +94,82 @@ logger = logging.getLogger(__name__)
 rate_limiter = RateLimiter(
     max_requests=RATE_LIMIT_REQUESTS, window_sec=RATE_LIMIT_WINDOW_SEC
 )
+
+
+async def handle_non_text_hint(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отклоняет гифки/стикеры/файлы на текстовых шагах диалога."""
+    await _safe_reply(
+        update,
+        "✏️ Отправьте текстовое сообщение (не файл, гифку или стикер).",
+    )
+    return None  # не меняем состояние ConversationHandler
+
+
+def non_text_hint_for(state):
+    """Хендлер-заглушка: отклоняет не-текст и остаётся в state."""
+
+    async def _hint(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await _safe_reply(
+            update,
+            "✏️ Отправьте текстовое сообщение (не файл, гифку или стикер).",
+        )
+        return state
+
+    return _hint
+
+
+def _message_text(update: Update) -> str:
+    """Текст сообщения или '' (для гифок/стикеров/файлов)."""
+    return (update.message.text or "").strip() if update.message else ""
+
+
+async def _reject_blank_text(update: Update, prompt: str, state):
+    await _safe_reply(update, prompt, reply_markup=CANCEL_KEYBOARD)
+    return state
+
+
+async def complete_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ловит текст комментария, если ConversationHandler потерял state."""
+    if not context.user_data.get("complete_request"):
+        return
+    if not is_admin(update.effective_user.id):
+        return
+    text = _message_text(update)
+    # Кнопки меню / отмена — не перехватываем, сбрасываем flow
+    menu_markers = (
+        "➕ Добавить заявку",
+        "✅ Завершить заявку",
+        "📋 Заявки",
+        "📋 Мои заявки",
+        "📊 Анализ",
+        "📊 Дашборд",
+        "⚙️ Настройки",
+        "⛔ Выход",
+        "❌ Отмена",
+        "/start",
+    )
+    if text in menu_markers:
+        context.user_data.pop("complete_request", None)
+        context.user_data.pop("complete_comment", None)
+        return
+    return await complete_comment_text_handler(update, context)
+
+
+async def complete_select_text_hint(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Текст вместо выбора заявки кнопкой."""
+    if context.user_data.get("complete_request"):
+        return await complete_comment_text_handler(update, context)
+    await _safe_reply(update, "👆 Выберите заявку кнопкой из списка.")
+    return COMPLETE_SELECT
+
+
+async def complete_confirm_text_hint(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    """Текст вместо кнопки подтверждения."""
+    await _safe_reply(update, "👆 Подтвердите или отмените кнопкой.")
+    return COMPLETE_CONFIRM
+
 
 # ===== СОСТОЯНИЯ CONVERSATION =====
 (
@@ -558,7 +640,7 @@ async def register_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def register_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Сохраняет имя инициатора"""
-    text = update.message.text.strip()
+    text = _message_text(update)
     user_id = update.effective_user.id
 
     # Ограничение длины
@@ -569,6 +651,13 @@ async def register_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
             update,
             "✍️ Введите ваше имя (как в справочнике или новое):",
             reply_markup=ReplyKeyboardRemove(),
+        )
+        return REG_NAME
+
+    if not is_meaningful_text(text, min_len=2):
+        await _safe_reply(
+            update,
+            "⚠️ Введите имя (минимум 2 символа, не только эмодзи).",
         )
         return REG_NAME
 
@@ -654,6 +743,8 @@ async def scheduled_report(context: ContextTypes.DEFAULT_TYPE):
 async def start_add_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Начало добавления заявки"""
     user_id = update.effective_user.id
+    context.user_data.pop("complete_request", None)
+    context.user_data.pop("complete_comment", None)
 
     if not rate_limiter.is_allowed(user_id):
         await _safe_reply(update, "⏳ Слишком много запросов. Подождите немного.")
@@ -708,7 +799,14 @@ async def start_add_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def set_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Сохраняет название и запрашивает количество"""
-    text = update.message.text.strip()
+    raw = update.message.text
+    if raw is None:
+        await _safe_reply(
+            update,
+            "✏️ Отправьте текстовое сообщение (не файл, гифку или стикер).",
+        )
+        return NAME
+    text = raw.strip()
 
     # Проверка на отмену
     cancel_keywords = ["❌ Отмена", "Отмена", "отмена", "cancel"]
@@ -783,6 +881,14 @@ async def set_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return NAME
 
+    if not is_meaningful_text(text, min_len=2):
+        await _safe_reply(
+            update,
+            "⚠️ Введите осмысленное наименование (минимум 2 символа, не только эмодзи).",
+            reply_markup=CANCEL_KEYBOARD,
+        )
+        return NAME
+
     name = truncate_field(text, MAX_FIELD_LENGTH)
     context.user_data["name"] = name
     _save_draft(update, context)
@@ -802,7 +908,7 @@ async def set_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def set_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Сохраняет количество и запрашивает единицу измерения"""
-    text = update.message.text.strip()
+    text = _message_text(update)
 
     # Проверка на отмену
     cancel_keywords = ["❌ Отмена", "Отмена", "отмена", "cancel"]
@@ -874,7 +980,7 @@ async def set_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def set_unit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Сохраняет единицу измерения и запрашивает инициатора (или ставит автоматически)"""
-    text = update.message.text.strip()
+    text = _message_text(update)
 
     # Проверка на отмену
     cancel_keywords = ["❌ Отмена", "Отмена", "отмена", "cancel"]
@@ -949,7 +1055,7 @@ async def set_unit(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def set_initiator(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Сохраняет инициатора и запрашивает объект"""
-    text = update.message.text.strip()
+    text = _message_text(update)
 
     # Проверка на отмену
     cancel_keywords = ["❌ Отмена", "Отмена", "отмена", "cancel"]
@@ -1017,9 +1123,15 @@ async def set_initiator(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def set_initiator_custom(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Сохраняет кастомное имя инициатора и переходит к объектам"""
-    context.user_data["initiator"] = truncate_field(
-        update.message.text.strip(), MAX_FIELD_LENGTH
-    )
+    text = _message_text(update)
+    if not is_meaningful_text(text, min_len=2):
+        await _reject_blank_text(
+            update,
+            "⚠️ Введите имя инициатора (минимум 2 символа).",
+            INITIATOR_CUSTOM,
+        )
+        return INITIATOR_CUSTOM
+    context.user_data["initiator"] = truncate_field(text, MAX_FIELD_LENGTH)
 
     try:
         lists = get_all_lists()
@@ -1042,7 +1154,7 @@ async def set_initiator_custom(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def set_object(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Сохраняет объект и запрашивает примечание"""
-    text = update.message.text.strip()
+    text = _message_text(update)
 
     # Проверка на отмену
     cancel_keywords = ["❌ Отмена", "Отмена", "отмена", "cancel"]
@@ -1088,6 +1200,14 @@ async def set_object(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return OBJECT_CUSTOM
 
+    if not is_meaningful_text(text, min_len=2):
+        await _reject_blank_text(
+            update,
+            "⚠️ Выберите объект кнопкой или введите название (минимум 2 символа).",
+            OBJECT,
+        )
+        return OBJECT
+
     context.user_data["object"] = truncate_field(text, MAX_FIELD_LENGTH)
 
     notes_keyboard = ReplyKeyboardMarkup(
@@ -1105,9 +1225,15 @@ async def set_object(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def set_object_custom(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Сохраняет кастомное название объекта и переходит к примечанию"""
-    context.user_data["object"] = truncate_field(
-        update.message.text.strip(), MAX_FIELD_LENGTH
-    )
+    text = _message_text(update)
+    if not is_meaningful_text(text, min_len=2):
+        await _reject_blank_text(
+            update,
+            "⚠️ Введите название объекта (минимум 2 символа).",
+            OBJECT_CUSTOM,
+        )
+        return OBJECT_CUSTOM
+    context.user_data["object"] = truncate_field(text, MAX_FIELD_LENGTH)
 
     notes_keyboard = ReplyKeyboardMarkup(
         [["➡️ Пропустить", "❌ Отмена"]], resize_keyboard=True
@@ -1124,7 +1250,7 @@ async def set_object_custom(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def set_notes_and_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Сохраняет примечание и показывает сводку для подтверждения"""
-    text = update.message.text.strip()
+    text = _message_text(update)
 
     # Проверка на отмену
     cancel_keywords = ["❌ Отмена", "Отмена", "отмена", "cancel"]
@@ -1254,7 +1380,7 @@ async def handle_photo_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def confirm_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Подтверждает и сохраняет заявку, либо отменяет"""
-    text = update.message.text.strip()
+    text = _message_text(update)
     user_id = update.effective_user.id
 
     if text == "❌ Отмена":
@@ -1676,7 +1802,7 @@ async def complete_comment_text_handler(
     """Принимает текст комментария от администратора"""
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
-    comment = update.message.text.strip()
+    comment = _message_text(update)
     if comment == "❌ Отмена":
         context.user_data.pop("complete_request", None)
         context.user_data.pop("complete_comment", None)
@@ -1685,6 +1811,20 @@ async def complete_comment_text_handler(
             update, "❌ Отменено.", reply_markup=get_main_keyboard(user_id)
         )
         return ConversationHandler.END
+
+    if not comment:
+        await _safe_reply(
+            update,
+            "✏️ Отправьте текст комментария или нажмите «➡️ Без комментария».",
+        )
+        return COMPLETE_COMMENT
+
+    if not is_meaningful_text(comment, min_len=1):
+        await _safe_reply(
+            update,
+            "⚠️ Комментарий должен содержать хотя бы одну букву или цифру.",
+        )
+        return COMPLETE_COMMENT
 
     context.user_data["complete_comment"] = truncate_field(comment, MAX_FIELD_LENGTH)
 
@@ -2130,7 +2270,7 @@ async def my_requests_search_text_handler(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ):
     """Обрабатывает текст поиска"""
-    text = update.message.text.strip()
+    text = _message_text(update)
 
     # Если пользователь нажал кнопку меню — выходим из диалога
     if text in _MENU_BUTTONS:
@@ -2702,7 +2842,7 @@ async def admin_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ===== ОБРАБОТКА ГЛАВНОГО МЕНЮ =====
 async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обрабатывает кнопки главного меню"""
-    text = update.message.text.strip()
+    text = _message_text(update)
     user_id = update.effective_user.id
 
     if text == "⛔ Выход":
@@ -3561,19 +3701,54 @@ def main():
             MessageHandler(filters.Regex("^➕ Добавить заявку$"), start_add_request)
         ],
         states={
-            NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_name)],
-            QUANTITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_quantity)],
-            UNIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_unit)],
-            INITIATOR: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_initiator)],
-            INITIATOR_CUSTOM: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, set_initiator_custom)
+            NAME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, set_name),
+                MessageHandler(
+                    ~filters.TEXT & ~filters.COMMAND, non_text_hint_for(NAME)
+                ),
             ],
-            OBJECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_object)],
+            QUANTITY: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, set_quantity),
+                MessageHandler(
+                    ~filters.TEXT & ~filters.COMMAND, non_text_hint_for(QUANTITY)
+                ),
+            ],
+            UNIT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, set_unit),
+                MessageHandler(
+                    ~filters.TEXT & ~filters.COMMAND, non_text_hint_for(UNIT)
+                ),
+            ],
+            INITIATOR: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, set_initiator),
+                MessageHandler(
+                    ~filters.TEXT & ~filters.COMMAND, non_text_hint_for(INITIATOR)
+                ),
+            ],
+            INITIATOR_CUSTOM: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, set_initiator_custom),
+                MessageHandler(
+                    ~filters.TEXT & ~filters.COMMAND,
+                    non_text_hint_for(INITIATOR_CUSTOM),
+                ),
+            ],
+            OBJECT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, set_object),
+                MessageHandler(
+                    ~filters.TEXT & ~filters.COMMAND, non_text_hint_for(OBJECT)
+                ),
+            ],
             OBJECT_CUSTOM: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, set_object_custom)
+                MessageHandler(filters.TEXT & ~filters.COMMAND, set_object_custom),
+                MessageHandler(
+                    ~filters.TEXT & ~filters.COMMAND, non_text_hint_for(OBJECT_CUSTOM)
+                ),
             ],
             NOTES: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, set_notes_and_save)
+                MessageHandler(filters.TEXT & ~filters.COMMAND, set_notes_and_save),
+                MessageHandler(
+                    ~filters.TEXT & ~filters.COMMAND, non_text_hint_for(NOTES)
+                ),
             ],
             PHOTO: [
                 MessageHandler(filters.PHOTO, handle_photo),
@@ -3582,12 +3757,18 @@ def main():
                 MessageHandler(filters.Regex("^❌ Отмена$"), cancel),
                 MessageHandler(filters.ALL & ~filters.COMMAND, handle_photo_hint),
             ],
-            CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, confirm_request)],
+            CONFIRM: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, confirm_request),
+                MessageHandler(
+                    ~filters.TEXT & ~filters.COMMAND, non_text_hint_for(CONFIRM)
+                ),
+            ],
         },
         fallbacks=[
             CommandHandler("cancel", cancel),
             MessageHandler(filters.Regex("^❌ Отмена$"), cancel),
         ],
+        per_message=False,
     )
 
     admin_handler = ConversationHandler(
@@ -3642,6 +3823,13 @@ def main():
                 CallbackQueryHandler(complete_page_handler, pattern=r"^crp:\d+$"),
                 CallbackQueryHandler(complete_batch_handler, pattern=r"^crb:\d+$"),
                 CallbackQueryHandler(complete_start, pattern=r"^crnoop$"),
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND, complete_select_text_hint
+                ),
+                MessageHandler(
+                    ~filters.TEXT & ~filters.COMMAND,
+                    non_text_hint_for(COMPLETE_SELECT),
+                ),
             ],
             COMPLETE_COMMENT: [
                 CallbackQueryHandler(
@@ -3650,17 +3838,29 @@ def main():
                 MessageHandler(
                     filters.TEXT & ~filters.COMMAND, complete_comment_text_handler
                 ),
+                MessageHandler(
+                    ~filters.TEXT & ~filters.COMMAND,
+                    non_text_hint_for(COMPLETE_COMMENT),
+                ),
             ],
             COMPLETE_CONFIRM: [
                 CallbackQueryHandler(
                     complete_confirm_handler, pattern=r"^cr:(confirm|cancel)$"
-                )
+                ),
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND, complete_confirm_text_hint
+                ),
+                MessageHandler(
+                    ~filters.TEXT & ~filters.COMMAND,
+                    non_text_hint_for(COMPLETE_CONFIRM),
+                ),
             ],
         },
         fallbacks=[
             CommandHandler("cancel", cancel),
             MessageHandler(filters.Regex("^❌ Отмена$"), cancel),
         ],
+        per_message=False,
     )
 
     status_handler = ConversationHandler(
@@ -3749,11 +3949,17 @@ def main():
     register_conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
-            REG_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_name)],
+            REG_NAME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, register_name),
+                MessageHandler(
+                    ~filters.TEXT & ~filters.COMMAND, non_text_hint_for(REG_NAME)
+                ),
+            ],
         },
         fallbacks=[
             CommandHandler("cancel", cancel),
         ],
+        per_message=False,
     )
 
     app.add_handler(register_conv)
@@ -3776,6 +3982,11 @@ def main():
         )
     )
     app.add_handler(MessageHandler(filters.Regex("^📊 Дашборд$"), dashboard_start))
+    # Страховка: если ConversationHandler потерял state, а заявка выбрана —
+    # всё равно принимаем комментарий (иначе текст уходит в handle_menu).
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, complete_text_router)
+    )
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu))
 
     tz = ZoneInfo(REPORT_TIMEZONE) if REPORT_TIMEZONE else None

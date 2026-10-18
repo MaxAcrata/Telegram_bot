@@ -1,6 +1,12 @@
 import pytest
 from datetime import datetime
-from utils import parse_date, format_date, validate_quantity, split_message
+from utils import (
+    parse_date,
+    format_date,
+    validate_quantity,
+    split_message,
+    is_meaningful_text,
+)
 
 
 def test_parse_date_formats():
@@ -32,6 +38,22 @@ def test_validate_quantity_invalid():
     assert validate_quantity("10a") is False
     assert validate_quantity("-10") is False
     assert validate_quantity("$") is False
+
+
+def test_is_meaningful_text():
+    """Текст с буквицей/цифрой — ок; эмодзи/пустота — нет."""
+    assert is_meaningful_text("Кирпич") is True
+    assert is_meaningful_text("Цемент 400") is True
+    assert is_meaningful_text("ok") is True
+    assert is_meaningful_text("") is False
+    assert is_meaningful_text("   ") is False
+    assert is_meaningful_text("🎮") is False
+    assert is_meaningful_text("👍") is False
+    assert is_meaningful_text("!!") is False
+    assert is_meaningful_text("A") is False  # min_len=2
+    assert is_meaningful_text("A", min_len=1) is True
+    assert is_meaningful_text("1") is False
+    assert is_meaningful_text(None) is False
 
 
 def test_split_message():

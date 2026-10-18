@@ -249,3 +249,106 @@ async def test_confirm_request_cancel(mock_clear):
 
     assert result == ConversationHandler.END
     assert context.user_data == {}
+
+
+# ===== Баг: гифки/эмодзи в текстовых полях =====
+
+
+@pytest.mark.asyncio
+@patch("bot.clear_conversation_state")
+async def test_set_name_rejects_empty_text(mock_clear):
+    """text=None (гифка/стикер) не должна сохраняться как имя."""
+    update = make_update(text=None)
+    update.message.text = None
+    context = make_context()
+
+    result = await set_name(update, context)
+
+    assert result == NAME
+    assert "name" not in context.user_data
+
+
+@pytest.mark.asyncio
+@patch("bot.clear_conversation_state")
+async def test_set_name_rejects_emoji_only(mock_clear):
+    """Эмодзи-«стикер» не должен проходить как наименование."""
+    update = make_update(text="🎮")
+    context = make_context()
+
+    result = await set_name(update, context)
+
+    assert result == NAME
+    assert "name" not in context.user_data
+
+
+@pytest.mark.asyncio
+@patch("bot.clear_conversation_state")
+@patch("bot.save_user_input")
+@patch("bot._save_draft")
+async def test_set_name_accepts_real_text(mock_draft, mock_save, mock_clear):
+    update = make_update(text="Кирпич облицовочный")
+    context = make_context()
+
+    result = await set_name(update, context)
+
+    assert result == QUANTITY
+    assert context.user_data["name"] == "Кирпич облицовочный"
+
+
+# ===== Баг: комментарий при завершении через роутер =====
+
+
+@pytest.mark.asyncio
+@patch("bot.is_admin", return_value=True)
+@patch("bot._safe_edit", new_callable=AsyncMock)
+@patch("bot._safe_reply", new_callable=AsyncMock)
+@patch("bot.complete_comment_text_handler", new_callable=AsyncMock)
+async def test_complete_text_router_accepts_comment(
+    mock_handler, mock_reply, mock_edit, mock_admin
+):
+    """Текст при complete_request в user_data уходит в comment handler."""
+    from bot import complete_text_router
+
+    mock_handler.return_value = 51  # COMPLETE_CONFIRM-like
+    update = make_update(text="Готово к отгрузке")
+    context = make_context()
+    context.user_data["complete_request"] = {"id": 1, "name": "Цемент"}
+
+    result = await complete_text_router(update, context)
+
+    mock_handler.assert_called_once()
+    assert result == 51
+
+
+@pytest.mark.asyncio
+@patch("bot.is_admin", return_value=True)
+@patch("bot.complete_comment_text_handler", new_callable=AsyncMock)
+async def test_complete_text_router_ignores_menu(mock_handler, mock_admin):
+    """Кнопки меню не должны съедаться как комментарий."""
+    from bot import complete_text_router
+
+    update = make_update(text="➕ Добавить заявку")
+    context = make_context()
+    context.user_data["complete_request"] = {"id": 1}
+
+    result = await complete_text_router(update, context)
+
+    mock_handler.assert_not_called()
+    assert result is None
+    assert "complete_request" not in context.user_data
+
+
+@pytest.mark.asyncio
+@patch("bot.is_admin", return_value=True)
+@patch("bot.complete_comment_text_handler", new_callable=AsyncMock)
+async def test_complete_text_router_no_request(mock_handler, mock_admin):
+    """Без complete_request роутер не трогает текст (пусть handle_menu)."""
+    from bot import complete_text_router
+
+    update = make_update(text="Привет")
+    context = make_context()
+
+    result = await complete_text_router(update, context)
+
+    mock_handler.assert_not_called()
+    assert result is None

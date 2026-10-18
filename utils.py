@@ -93,6 +93,17 @@ def validate_quantity(value: str) -> bool:
         return False
 
 
+def is_meaningful_text(value: str, min_len: int = 2) -> bool:
+    """False для пустых, пробелов и «мусора» (эмодзи/пунктуация без букв/цифр)."""
+    if value is None:
+        return False
+    text = value.strip()
+    if len(text) < min_len:
+        return False
+    # Должна быть хотя бы одна буква или цифра (не только эмодзи/знаки)
+    return any(ch.isalnum() for ch in text)
+
+
 def truncate_field(value: str, max_length: int = 500) -> str:
     """Обрезает поле до максимальной длины."""
     if len(value) <= max_length:
