@@ -1,6 +1,9 @@
 import asyncio
 import json
 import logging
+
+# Маркер сборки — виден в логах Amvera, чтобы понимать, какая версия запущена.
+APP_VERSION = "2026-10-18.06b87b4"
 from datetime import time, datetime, date
 from html import escape
 from zoneinfo import ZoneInfo
@@ -3799,7 +3802,7 @@ def main():
     )
 
     logger.info(
-        f" Бот запущен. Отчёт ежедневно в {REPORT_HOUR:02d}:{REPORT_MINUTE:02d}"
+        f"Бот запущен (v{APP_VERSION}). Отчёт ежедневно в {REPORT_HOUR:02d}:{REPORT_MINUTE:02d}"
     )
     app.run_polling()
 
