@@ -14,7 +14,7 @@ Telegram bot for managing construction material requests. Data lives in a local 
 | `config.py` | Loads `.env`, validates config at startup (ranges, paths, IDs), safe parsing of ADMIN_IDS | `dotenv` |
 | `core.py` | Report generation: HTML formatting, explicit status labels, overdue analysis, active/completed modes, clickable links, photo count labels, request IDs. Dashboard generation (`build_dashboard()`) | `db`, `config` |
 | `db.py` | SQLite database: schema, migrations (status column, UNIQUE telegram_id), CRUD for requests, lists, settings, initiator-user links, photo storage, audit log, backup API, persistent conversation state, delete, search by status, dashboard counts, ownership check | `sqlite3`, `config` |
-| `utils.py` | Quantity validation, field truncation, rate limiter with auto-cleanup, HTML-safe message splitting | (standalone) |
+| `utils.py` | Quantity validation, field truncation, `is_meaningful_text()` (reject empty/emoji-only input), rate limiter with auto-cleanup, HTML-safe message splitting | (standalone) |
 
 Data flow: `bot.py` → `db.py` → SQLite → `core.py` → HTML report / dashboard
 
@@ -30,7 +30,7 @@ Data flow: `bot.py` → `db.py` → SQLite → `core.py` → HTML report / dashb
   - `initiator_users` — привязка инициаторов к Telegram-ID (UNIQUE на `telegram_id`)
   - `audit_log` — журнал действий (created/completed/edited/status_changed/deleted)
   - `conversation_state` — сохранённые черновики диалогов (persistent across restarts)
-- **Conversation states (заявки)**: `NAME → QUANTITY → UNIT → INITIATOR (auto-skip if linked) → INITIATOR_CUSTOM → OBJECT → OBJECT_CUSTOM → NOTES → CONFIRM`. NOTES accepts additional info or `➡️ Пропустить`. CONFIRM accepts `✅ Подтвердить`, `📎 Добавить фото` (opens photo upload), `✏️ Исправить` (returns to NAME with data preserved), `🔄 Повторить`, or `❌ Отмена`. PHOTO state is entered from CONFIRM when user clicks `📎 Добавить foto`.
+- **Conversation states (заявки)**: `NAME → QUANTITY → UNIT → INITIATOR (auto-skip if linked) → INITIATOR_CUSTOM → OBJECT → OBJECT_CUSTOM → NOTES → CONFIRM`. NOTES accepts additional info or `➡️ Пропустить`. CONFIRM accepts `✅ Подтвердить`, `📎 Добавить фото` (opens photo upload), `✏️ Исправить` (returns to NAME with data preserved), `🔄 Повторить`, or `❌ Отмена`. PHOTO state is entered from CONFIRM when user clicks `📎 Добавить фото`.
 - **Conversation states (регистрация)**: `REG_NAME` — non-admin users pick their initiator name on first `/start`.
 - **Conversation states (завершение заявки)**: `COMPLETE_SELECT → COMPLETE_COMMENT → COMPLETE_CONFIRM` — admin selects active request, optionally adds comment, then confirms.
 - **Conversation states (анализ)**: filter choice `active` / `completed` via inline buttons. Report includes inline buttons for viewing attached photos and request details.
@@ -38,6 +38,7 @@ Data flow: `bot.py` → `db.py` → SQLite → `core.py` → HTML report / dashb
 - **Conversation states (админ-панель)**: `ADMIN_MENU → ADMIN_LIST_VIEW → ADMIN_RENAME_NEW / ADMIN_DELETE / ADMIN_ADD_VALUE / ADMIN_BUTTONS_EDIT / ADMIN_CLEAR_DB_CONFIRM` — manage reference lists, backup, audit log, clear DB.
 - **HTML in Telegram**: Reports use Telegram HTML parse mode. `split_message()` in `utils.py` splits long messages on `\n` boundaries, closes unclosed HTML tags per chunk, and preserves tag attributes (e.g. `<a href>`).
 - **Clickable links**: `make_links_clickable()` in `core.py` converts URLs in notes to `<a href>` tags. `disable_web_page_preview=True` on all report messages.
+- **Report contract**: `build_report(save_to_file=True, mode="active"|"completed")` returns a **4-tuple** `(text, ids_with_photos, all_ids, requests_data)`. All callers must unpack 4 values (including `scheduled_report`).
 - **Photos**: Stored as Telegram `file_id` in `request_photos` table. Displayed as `📎 Фото: N шт.` in reports. Viewing via inline buttons — access restricted to admins and request owners (IDOR protection).
 - **SOCKS5 proxy**: Optional, configured via `SOCKS5_PROXY` env var.
 - **CI/CD**: GitHub Actions runs flake8, black (`==26.5.1`), and pytest on every push/PR to `main`.
@@ -55,8 +56,11 @@ Data flow: `bot.py` → `db.py` → SQLite → `core.py` → HTML report / dashb
 9. `conv_handler` — `➕ Добавить заявку` button
 10. `CallbackQueryHandler(show_request_photos)` — photo viewing (with IDOR check)
 11. `CallbackQueryHandler(show_request_details)` — request details (with IDOR check)
-12. `MessageHandler(📊 Дашборд)` — dashboard for admins
-13. `handle_menu` — catch-all for remaining text (includes redirect to analysis and dashboard)
+12. `CallbackQueryHandler(dashboard_reqs_callback)` — dashboard request list (`reqs:all:<page>`)
+13. `CallbackQueryHandler(dashboard_report_callback)` — dashboard report (`report:active|completed`)
+14. `MessageHandler(📊 Дашборд)` — dashboard for admins
+15. `complete_text_router` — safety net for completion comments when ConversationHandler loses state
+16. `handle_menu` — catch-all for remaining text (includes redirect to analysis and dashboard)
 
 **Important**: `start()` must return `ConversationHandler.END` for admins and registered users to avoid blocking subsequent handlers.
 
@@ -75,7 +79,7 @@ When requests are **batch-completed** (all on page):
 1. Admin inline message with count and actual IDs
 2. Shared chat (`TELEGRAM_CHAT_ID`) with summary notification
 
-Photos are NOT included in notifications.
+Photos are NOT included in notifications. Daily `scheduled_report` and manual analysis attach `_build_photo_keyboard()` (detail buttons `detail:<id>` with status emoji).
 
 ## Running
 
@@ -103,11 +107,12 @@ black --check --diff .
 - **Core tests**: `test_core.py` mocks `db.get_active_requests` and `db.get_photo_counts` to return fixture data.
 - **Bot tests**: `test_bot.py` mocks `db.get_all_lists`, `db.add_request_with_photos`, and `db.add_request_photo` to avoid real DB calls.
 - **Integration tests**: `test_integration.py` tests full conversation flows (create request, complete, register, cancel, rate limit, field limits).
-- **All 77 tests pass**.
+- **All 86 tests pass**.
 
 When adding new tests:
 - Async bot handlers: use `@pytest.mark.asyncio`, mock `update.message.reply_text` with `AsyncMock()`, mock `context.user_data` as a plain dict.
 - DB functions: use the `tmp_path` fixture pattern from `test_db.py`.
+- Text/validation helpers: see `tests/test_utils.py`.
 
 ## Common Pitfalls
 
@@ -161,6 +166,7 @@ When adding new tests:
 
 ### Input validation
 - `validate_quantity()` rejects negative, zero, `inf`, and `NaN` values (`math.isfinite` check). Commas are normalized to dots before saving.
+- `is_meaningful_text()` rejects empty/whitespace/single-char/emoji-only names. Non-text (GIF, sticker, document, voice) is rejected by `non_text_hint_for(state)` handlers on each dialog step — do not rely on `filters.TEXT` alone for user feedback.
 - `bpr` setting is range-checked (1–6).
 - `callback_data` values use numeric list IDs (not truncated text) to fit Telegram's 64-byte limit.
 - `date.fromisoformat()` calls in `core.py` are wrapped in try/except to handle corrupt dates without crashing reports.
@@ -183,7 +189,7 @@ When adding new tests:
 - `backup_db()` creates a copy via SQLite backup API with UUID-enriched filenames to prevent collisions. Connections are closed in `finally` blocks.
 - `verify_backup()` opens the file in `mode=ro` (read-only), checks `PRAGMA integrity_check` AND verifies that key application tables (`requests`, `lists`, `request_photos`) exist. Rejects empty/corrupt databases.
 - `clear_all_requests()` **aborts if `backup_db()` returns `None`** (backup creation failed). Only proceeds after successful backup + verification.
-- `audit_log` table records all significant actions with user_id, action type, and details (created, completed, edited, status_changed, deleted, batch_completed, archived, db_cleared, list_added, list_deleted, list_renamed).
+- `audit_log` table records all significant actions with user_id, action type, and details (created, completed, edited, status_changed, deleted, batch_completed, archived, db_cleared, registered, list_added, list_deleted, list_renamed).
 - Admin panel includes `💾 Резервная копия` and `📋 Журнал действий` sections.
 
 ### Persistent state
