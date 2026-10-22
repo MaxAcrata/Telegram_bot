@@ -3,7 +3,7 @@ import json
 import logging
 
 # Маркер сборки — виден в логах Amvera, чтобы понимать, какая версия запущена.
-APP_VERSION = "2026-10-18.b1531b4"
+APP_VERSION = "2026-10-22.a4af99e"
 from datetime import time, datetime, date
 from html import escape
 from zoneinfo import ZoneInfo
