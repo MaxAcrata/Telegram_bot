@@ -727,8 +727,11 @@ async def scheduled_report(context: ContextTypes.DEFAULT_TYPE):
     context.bot_data[report_flag] = True
 
     try:
-        result, _ids, _all = build_report()
-        await send_long_message(context, chat_id, result, parse_mode="HTML")
+        result, ids_with_photos, all_ids, requests_data = build_report()
+        keyboard = _build_photo_keyboard(ids_with_photos, all_ids, requests_data)
+        await send_long_message(
+            context, chat_id, result, parse_mode="HTML", reply_markup=keyboard
+        )
     except Exception as e:
         logger.error(f"Ошибка автоотчёта: {e}", exc_info=True)
         try:

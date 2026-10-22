@@ -352,3 +352,52 @@ async def test_complete_text_router_no_request(mock_handler, mock_admin):
 
     mock_handler.assert_not_called()
     assert result is None
+
+
+# ===== Автоотчёт =====
+
+
+@pytest.mark.asyncio
+@patch("bot.send_long_message", new_callable=AsyncMock)
+@patch("bot.build_report")
+async def test_scheduled_report_unpacks_four_tuple(mock_build, mock_send):
+    """scheduled_report должен принимать 4-кортеж от build_report (regression)."""
+    from bot import scheduled_report
+
+    mock_build.return_value = (
+        "<b>Отчёт</b>",
+        [1, 2],
+        [1, 2, 3],
+        [{"id": 1, "status": "new", "request_date": "2026-10-01"}],
+    )
+    context = make_context()
+    context.job.chat_id = -100123
+
+    await scheduled_report(context)
+
+    mock_build.assert_called_once()
+    mock_send.assert_called_once()
+    assert mock_send.call_args[0][1] == -100123
+    assert mock_send.call_args[0][2] == "<b>Отчёт</b>"
+    keyboard = mock_send.call_args.kwargs["reply_markup"]
+    assert keyboard is not None
+    btn_texts = [btn.text for row in keyboard.inline_keyboard for btn in row]
+    assert any("#1" in t for t in btn_texts)
+    assert any("#3" in t for t in btn_texts)
+    assert context.bot_data["_report_running_-100123"] is False
+
+
+@pytest.mark.asyncio
+@patch("bot.send_long_message", new_callable=AsyncMock)
+@patch("bot.build_report", side_effect=ValueError("boom"))
+async def test_scheduled_report_error_clears_flag(mock_build, mock_send):
+    """Ошибка внутри автоотчёта не должна оставлять флаг зацикливания."""
+    from bot import scheduled_report
+
+    context = make_context()
+    context.job.chat_id = -100999
+    context.bot.send_message = AsyncMock()
+
+    await scheduled_report(context)
+
+    assert context.bot_data["_report_running_-100999"] is False
