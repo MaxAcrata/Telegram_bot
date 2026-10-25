@@ -294,5 +294,5 @@ def _save_report(text: str):
     try:
         with open(REPORT_FILE_NAME, "w", encoding="utf-8") as f:
             f.write(text)
-    except Exception as e:
+    except OSError as e:
         logger.warning(f"Не удалось сохранить отчёт: {e}")

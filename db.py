@@ -142,7 +142,7 @@ def _column_exists(conn, table_name: str, column_name: str) -> bool:
     try:
         rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
         return any(row["name"] == column_name for row in rows)
-    except Exception:
+    except sqlite3.Error:
         return False
 
 
@@ -209,7 +209,7 @@ def audit_log(
                    VALUES (?, ?, ?, ?, ?)""",
                 (request_id, user_id, user_name, action, details),
             )
-    except Exception as e:
+    except sqlite3.Error as e:
         logger.warning(f"audit_log ошибка: {e}")
 
 
@@ -229,7 +229,7 @@ def get_audit_log(request_id: Optional[int] = None, limit: int = 50) -> List[dic
                     (limit,),
                 ).fetchall()
         return [dict(r) for r in rows]
-    except Exception as e:
+    except sqlite3.Error as e:
         logger.warning(f"get_audit_log ошибка: {e}")
         return []
 
@@ -254,20 +254,20 @@ def backup_db() -> Optional[str]:
 
         logger.info(f"Резервная копия создана: {backup_path}")
         return str(backup_path)
-    except Exception as e:
+    except (sqlite3.Error, OSError) as e:
         logger.error(f"Ошибка создания резервной копии: {e}")
         return None
     finally:
         if dest is not None:
             try:
                 dest.close()
-            except Exception:
-                pass
+            except sqlite3.Error as e:
+                logger.debug(f"Не удалось закрыть соединение backup dest: {e}")
         if source is not None:
             try:
                 source.close()
-            except Exception:
-                pass
+            except sqlite3.Error as e:
+                logger.debug(f"Не удалось закрыть соединение backup source: {e}")
 
 
 def verify_backup(backup_path: str) -> bool:
@@ -285,7 +285,7 @@ def verify_backup(backup_path: str) -> bool:
         ).fetchall()
         conn.close()
         return len(tables) >= 3
-    except Exception as e:
+    except (sqlite3.Error, OSError) as e:
         logger.error(f"Ошибка проверки резервной копии: {e}")
         return False
 
@@ -305,7 +305,7 @@ def save_conversation_state(user_id: int, state_data: str):
                        updated_at = excluded.updated_at""",
                 (user_id, state_data, datetime.now().isoformat()),
             )
-    except Exception as e:
+    except sqlite3.Error as e:
         logger.warning(f"save_conversation_state ошибка: {e}")
 
 
@@ -318,7 +318,7 @@ def load_conversation_state(user_id: int) -> Optional[str]:
                 (user_id,),
             ).fetchone()
         return row["state_data"] if row else None
-    except Exception as e:
+    except sqlite3.Error as e:
         logger.warning(f"load_conversation_state ошибка: {e}")
         return None
 
@@ -328,7 +328,7 @@ def clear_conversation_state(user_id: int):
     try:
         with get_conn() as conn:
             conn.execute("DELETE FROM conversation_state WHERE user_id = ?", (user_id,))
-    except Exception as e:
+    except sqlite3.Error as e:
         logger.warning(f"clear_conversation_state ошибка: {e}")
 
 
@@ -753,7 +753,7 @@ def get_setting(key: str, default: str = "") -> str:
                 "SELECT value FROM settings WHERE key = ?", (key,)
             ).fetchone()
         return row["value"] if row else default
-    except Exception as e:
+    except sqlite3.Error as e:
         logger.warning(f"get_setting({key!r}) ошибка: {e}")
         return default
 
@@ -875,7 +875,7 @@ def is_request_owner(request_id: int, telegram_id: int) -> bool:
                 (req["initiator"], telegram_id),
             ).fetchone()
             return link is not None
-    except Exception as e:
+    except sqlite3.Error as e:
         logger.warning(f"is_request_owner({request_id}, {telegram_id}) ошибка: {e}")
         return False
 
@@ -973,7 +973,7 @@ def get_request_photos(request_id: int) -> List[str]:
                 (request_id,),
             ).fetchall()
         return [row["file_id"] for row in rows]
-    except Exception as e:
+    except sqlite3.Error as e:
         logger.warning(f"get_request_photos({request_id}) ошибка: {e}")
         return []
 
@@ -998,7 +998,7 @@ def get_photo_counts(request_ids: List[int]) -> Dict[int, int]:
                 ).fetchall()
             result.update({row["request_id"]: row["cnt"] for row in rows})
         return result
-    except Exception as e:
+    except sqlite3.Error as e:
         logger.warning(f"get_photo_counts ошибка: {e}")
         return {}
 
@@ -1027,7 +1027,7 @@ def get_initiator_tg_id(initiator_name: str) -> Optional[int]:
                 (initiator_name,),
             ).fetchone()
         return row["telegram_id"] if row else None
-    except Exception as e:
+    except sqlite3.Error as e:
         logger.warning(f"get_initiator_tg_id({initiator_name!r}) ошибка: {e}")
         return None
 
@@ -1041,7 +1041,7 @@ def get_initiator_by_tg_id(telegram_id: int) -> Optional[str]:
                 (telegram_id,),
             ).fetchone()
         return row["initiator_name"] if row else None
-    except Exception as e:
+    except sqlite3.Error as e:
         logger.warning(f"get_initiator_by_tg_id({telegram_id}) ошибка: {e}")
         return None
 
@@ -1070,7 +1070,7 @@ def save_user_input(user_id: int, field_type: str, value: str):
                    ON CONFLICT(user_id, field_type, value) DO UPDATE SET created_at = CURRENT_TIMESTAMP""",
                 (user_id, field_type, value.strip()),
             )
-    except Exception as e:
+    except sqlite3.Error as e:
         logger.warning(f"save_user_input ошибка: {e}")
 
 
@@ -1086,7 +1086,7 @@ def get_user_input_history(user_id: int, field_type: str, limit: int = 5) -> Lis
                 (user_id, field_type, limit),
             ).fetchall()
         return [row["value"] for row in rows]
-    except Exception as e:
+    except sqlite3.Error as e:
         logger.warning(f"get_user_input_history ошибка: {e}")
         return []
 
@@ -1104,6 +1104,6 @@ def get_popular_inputs(field_type: str, limit: int = 5) -> List[str]:
                 (field_type, limit),
             ).fetchall()
         return [row["value"] for row in rows]
-    except Exception as e:
+    except sqlite3.Error as e:
         logger.warning(f"get_popular_inputs ошибка: {e}")
         return []

@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import sqlite3
 from datetime import time, datetime, date
 from html import escape
 from zoneinfo import ZoneInfo
@@ -396,9 +397,9 @@ async def show_request_photos(update: Update, context: ContextTypes.DEFAULT_TYPE
                     photo=file_id,
                     disable_notification=True,
                 )
-            except Exception as e2:
+            except TelegramError as e2:
                 logger.warning(f"Не удалось отправить фото после retry: {e2}")
-        except Exception as e:
+        except TelegramError as e:
             logger.warning(f"Не удалось отправить фото {file_id}: {e}")
             await _safe_send(
                 context, query.message.chat_id, "⚠️ Не удалось отправить одно из фото."
@@ -639,8 +640,9 @@ async def scheduled_report(context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Ошибка автоотчёта: {e}", exc_info=True)
         try:
             await _safe_send(context, chat_id, "❌ Ошибка при формировании автоотчёта.")
-        except Exception:
-            pass
+        except TelegramError as e2:
+            # Уведомление об ошибке само не доставлено — исходная уже в логе
+            logger.warning(f"Не удалось отправить сообщение об ошибке автоотчёта: {e2}")
     finally:
         context.bot_data[report_flag] = False
 
@@ -845,7 +847,8 @@ async def set_quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         lists = get_all_lists()
         units = lists.get("unit", ["шт", "кг", "л", "м2", "м3", "лист", "м.п.", "комп"])
-    except Exception:
+    except (sqlite3.Error, OSError) as e:
+        logger.warning(f"Не удалось загрузить список единиц, используются значения по умолчанию: {e}")
         units = ["шт", "кг", "л", "м2", "м3", "лист", "м.п.", "комп"]
 
     cols = int(get_setting("buttons_per_row_unit", "3"))
@@ -898,7 +901,8 @@ async def set_unit(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             lists = get_all_lists()
             objects = lists.get("object", ["Солнечное", "Привилегия", "Не указан"])
-        except Exception:
+        except (sqlite3.Error, OSError) as e:
+            logger.warning(f"Не удалось загрузить список объектов, используются значения по умолчанию: {e}")
             objects = ["Солнечное", "Привилегия", "Не указан"]
 
         cols = int(get_setting("buttons_per_row_object", "2"))
@@ -919,8 +923,8 @@ async def set_unit(update: Update, context: ContextTypes.DEFAULT_TYPE):
         initiators = lists.get(
             "initiator", ["Алексей", "Анатолий", "Михаил", "Игорь", "Другое"]
         )
-    except Exception as e:
-        logger.error(f"Ошибка загрузки списков: {e}")
+    except (sqlite3.Error, OSError) as e:
+        logger.warning(f"Не удалось загрузить список инициаторов, используются значения по умолчанию: {e}")
         initiators = ["Алексей", "Анатолий", "Михаил", "Игорь", "Другое"]
 
     cols = int(get_setting("buttons_per_row_initiator", "4"))
@@ -957,7 +961,8 @@ async def set_initiator(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             lists = get_all_lists()
             units = lists.get("unit", ["шт", "кг", "л", "м2", "м3", "лист", "м.п.", "комп"])
-        except Exception:
+        except (sqlite3.Error, OSError) as e:
+            logger.warning(f"Не удалось загрузить список единиц, используются значения по умолчанию: {e}")
             units = ["шт", "кг", "л", "м2", "м3", "лист", "м.п.", "комп"]
 
         cols = int(get_setting("buttons_per_row_unit", "3"))
@@ -986,7 +991,8 @@ async def set_initiator(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         lists = get_all_lists()
         objects = lists.get("object", ["Солнечное", "Привилегия", "Не указан"])
-    except Exception:
+    except (sqlite3.Error, OSError) as e:
+        logger.warning(f"Не удалось загрузить список объектов, используются значения по умолчанию: {e}")
         objects = ["Солнечное", "Привилегия", "Не указан"]
 
     cols = int(get_setting("buttons_per_row_object", "2"))
@@ -1011,7 +1017,8 @@ async def set_initiator_custom(update: Update, context: ContextTypes.DEFAULT_TYP
     try:
         lists = get_all_lists()
         objects = lists.get("object", ["Солнечное", "Привилегия", "Не указан"])
-    except Exception:
+    except (sqlite3.Error, OSError) as e:
+        logger.warning(f"Не удалось загрузить список объектов, используются значения по умолчанию: {e}")
         objects = ["Солнечное", "Привилегия", "Не указан"]
 
     cols = int(get_setting("buttons_per_row_object", "2"))
@@ -1050,8 +1057,8 @@ async def set_object(update: Update, context: ContextTypes.DEFAULT_TYPE):
             initiators = lists.get(
                 "initiator", ["Алексей", "Анатолий", "Михаил", "Игорь", "Другое"]
             )
-        except Exception as e:
-            logger.error(f"Ошибка загрузки списков: {e}")
+        except (sqlite3.Error, OSError) as e:
+            logger.warning(f"Не удалось загрузить список инициаторов, используются значения по умолчанию: {e}")
             initiators = ["Алексей", "Анатолий", "Михаил", "Игорь", "Другое"]
 
         cols = int(get_setting("buttons_per_row_initiator", "4"))
@@ -1130,7 +1137,8 @@ async def set_notes_and_save(update: Update, context: ContextTypes.DEFAULT_TYPE)
         try:
             lists = get_all_lists()
             objects = lists.get("object", ["Солнечное", "Привилегия", "Не указан"])
-        except Exception:
+        except (sqlite3.Error, OSError) as e:
+            logger.warning(f"Не удалось загрузить список объектов, используются значения по умолчанию: {e}")
             objects = ["Солнечное", "Привилегия", "Не указан"]
 
         cols = int(get_setting("buttons_per_row_object", "2"))
@@ -1361,7 +1369,7 @@ async def confirm_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 disable_web_page_preview=True,
                 reply_markup=notify_markup,
             )
-        except Exception as e:
+        except TelegramError as e:
             logger.warning(f"Не удалось отправить уведомление о новой заявке: {e}")
 
         context.user_data.clear()
@@ -1402,7 +1410,8 @@ def _save_draft(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         state = {k: v for k, v in context.user_data.items() if not k.startswith("_")}
         save_conversation_state(user_id, json.dumps(state, ensure_ascii=False))
-    except Exception as e:
+    except (TypeError, ValueError) as e:
+        # save_conversation_state сам логирует ошибки БД; здесь — ошибки сериализации
         logger.warning(f"Не удалось сохранить черновик: {e}")
 
 
@@ -1593,7 +1602,7 @@ async def complete_batch_handler(update: Update, context: ContextTypes.DEFAULT_T
                 parse_mode="HTML",
                 disable_web_page_preview=True,
             )
-        except Exception as e:
+        except TelegramError as e:
             logger.warning(f"Не удалось отправить уведомление о массовом завершении: {e}")
 
     context.user_data.pop("complete_requests", None)
@@ -1801,7 +1810,7 @@ async def complete_confirm_handler(update: Update, context: ContextTypes.DEFAULT
             disable_web_page_preview=True,
             reply_markup=notify_markup,
         )
-    except Exception as e:
+    except TelegramError as e:
         logger.warning(f"Не удалось отправить уведомление в чат: {e}")
 
     # Уведомление инициатору в ЛС
@@ -1818,7 +1827,7 @@ async def complete_confirm_handler(update: Update, context: ContextTypes.DEFAULT
                     disable_web_page_preview=True,
                     reply_markup=notify_markup,
                 )
-            except Exception as e:
+            except TelegramError as e:
                 logger.warning(
                     f"Не удалось отправить ЛС инициатору {initiator_name}: {e}"
                 )
@@ -3492,8 +3501,9 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
                 update.effective_chat.id,
                 "⚠️ Произошла ошибка. Попробуйте ещё раз или обратитесь к администратору.",
             )
-        except Exception:
-            pass
+        except TelegramError as e:
+            # Пользователь не получил всплывающее сообщение — исходная ошибка уже в логе
+            logger.warning(f"Не удалось отправить уведомление об ошибке пользователю: {e}")
 
 
 # ===== ГЛАВНАЯ ФУНКЦИЯ =====

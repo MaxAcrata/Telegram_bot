@@ -105,9 +105,9 @@ _DEFAULT_DB = str(Path(__file__).resolve().parent / "bot.db")
 DB_PATH = os.getenv("DB_PATH", _DEFAULT_DB)
 
 # ===== REPORTS =====
-OVERDUE_DAYS = int(os.getenv("OVERDUE_DAYS", 3))
-REPORT_HOUR = int(os.getenv("REPORT_HOUR", 9))
-REPORT_MINUTE = int(os.getenv("REPORT_MINUTE", 0))
+OVERDUE_DAYS = int(os.getenv("OVERDUE_DAYS", "3"))
+REPORT_HOUR = int(os.getenv("REPORT_HOUR", "9"))
+REPORT_MINUTE = int(os.getenv("REPORT_MINUTE", "0"))
 REPORT_FILE_NAME = "report.txt"
 
 # ===== PROXY =====
