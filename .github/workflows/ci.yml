@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install flake8 "black==26.5.1" pytest pytest-asyncio
+
+      - name: Create .env for tests
+        run: |
+          echo "TELEGRAM_BOT_TOKEN=1234567890:ABCDEFGHIJKLMNOPQRSTUVWXYZ" > .env
+          echo "TELEGRAM_CHAT_ID=123456789" >> .env
+          echo "ADMIN_IDS=123456789" >> .env
+          echo "DB_PATH=bot_test.db" >> .env
+          echo "OVERDUE_DAYS=3" >> .env
+          echo "REPORT_HOUR=9" >> .env
+          echo "REPORT_MINUTE=0" >> .env
+
+      - name: Lint with flake8
+        run: |
+          # Stop the build on syntax errors or undefined names
+          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+          # Warnings as non-blocking
+          flake8 . --count --exit-zero --max-line-length=120 --statistics
+
+      - name: Check formatting with black
+        run: |
+          black --check --diff .
+
+      - name: Run tests
+        env:
+          TELEGRAM_BOT_TOKEN: "1234567890:ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+          TELEGRAM_CHAT_ID: "123456789"
+          ADMIN_IDS: "123456789"
+          DB_PATH: "bot_test.db"
+        run: |
+          python -m pytest tests/ -v --tb=short

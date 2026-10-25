@@ -1,0 +1,198 @@
+# AGENTS.md
+
+Instructions for AI agents working with this codebase.
+
+## Project Overview
+
+Telegram bot for managing construction material requests. Data lives in a local SQLite database (`bot.db`). Users submit requests through a 6-step conversation flow with optional photo upload via button; admins receive daily HTML reports, can view all requests with filters, change statuses, complete requests, view a dashboard, and manage reference lists.
+
+## Architecture
+
+| File | Responsibility | Depends on |
+|---|---|---|
+| `bot.py` | Telegram handlers, ConversationHandlers, keyboards, scheduled report, admin panel, registration, notifications, photo handling, rate limiting, persistent drafts, my requests, search, pagination, batch complete, requests list with filters, request card, edit/delete UI, dashboard | `core`, `db`, `utils`, `config` |
+| `config.py` | Loads `.env`, validates config at startup (ranges, paths, IDs), safe parsing of ADMIN_IDS | `dotenv` |
+| `core.py` | Report generation: HTML formatting, explicit status labels, overdue analysis, active/completed modes, clickable links, photo count labels, request IDs. Dashboard generation (`build_dashboard()`) | `db`, `config` |
+| `db.py` | SQLite database: schema, migrations (status column, UNIQUE telegram_id), CRUD for requests, lists, settings, initiator-user links, photo storage, audit log, backup API, persistent conversation state, delete, search by status, dashboard counts, ownership check | `sqlite3`, `config` |
+| `utils.py` | Quantity validation, field truncation, rate limiter with auto-cleanup, HTML-safe message splitting | (standalone) |
+
+Data flow: `bot.py` → `db.py` → SQLite → `core.py` → HTML report / dashboard
+
+## Key Conventions
+
+- **Language**: All user-facing strings are in Russian. Variable names and docstrings in English.
+- **Config**: All secrets and environment-dependent values in `.env`. `config.py` defines `_validate_config()` which checks ranges and paths — called explicitly from `bot.py main()` (not at import time, so tests can import without `.env`). `ADMIN_IDS` parsing uses try/except — non-numeric values are skipped with a warning, not a crash.
+- **Database**: SQLite via `sqlite3` (stdlib). Schema auto-created by `db.init_db()` with automatic migrations. Tables:
+  - `requests` — заявки (with `status`: `new`/`ordered`/`delivered`/`done`/`archived`)
+  - `request_photos` — фото к заявкам (связь 1:N с `requests`)
+  - `lists` — справочники (`list_type`: `initiator`, `object`, `unit`)
+  - `settings` — настройки (кнопок в строке и т.д.)
+  - `initiator_users` — привязка инициаторов к Telegram-ID (UNIQUE на `telegram_id`)
+  - `audit_log` — журнал действий (created/completed/edited/status_changed/deleted)
+  - `conversation_state` — сохранённые черновики диалогов (persistent across restarts)
+- **Conversation states (заявки)**: `NAME → QUANTITY → UNIT → INITIATOR (auto-skip if linked) → INITIATOR_CUSTOM → OBJECT → OBJECT_CUSTOM → NOTES → CONFIRM`. NOTES accepts additional info or `➡️ Пропустить`. CONFIRM accepts `✅ Подтвердить`, `📎 Добавить фото` (opens photo upload), `✏️ Исправить` (returns to NAME with data preserved), `🔄 Повторить`, or `❌ Отмена`. PHOTO state is entered from CONFIRM when user clicks `📎 Добавить foto`.
+- **Conversation states (регистрация)**: `REG_NAME` — non-admin users pick their initiator name on first `/start`.
+- **Conversation states (завершение заявки)**: `COMPLETE_SELECT → COMPLETE_COMMENT → COMPLETE_CONFIRM` — admin selects active request, optionally adds comment, then confirms.
+- **Conversation states (анализ)**: filter choice `active` / `completed` via inline buttons. Report includes inline buttons for viewing attached photos and request details.
+- **Conversation states (заявки — список)**: `REQUESTS_LIST → REQUESTS_CARD` — admin views all requests with status filters and pagination. Card shows actions: change status, view photos, delete.
+- **Conversation states (админ-панель)**: `ADMIN_MENU → ADMIN_LIST_VIEW → ADMIN_RENAME_NEW / ADMIN_DELETE / ADMIN_ADD_VALUE / ADMIN_BUTTONS_EDIT / ADMIN_CLEAR_DB_CONFIRM` — manage reference lists, backup, audit log, clear DB.
+- **HTML in Telegram**: Reports use Telegram HTML parse mode. `split_message()` in `utils.py` splits long messages on `\n` boundaries, closes unclosed HTML tags per chunk, and preserves tag attributes (e.g. `<a href>`).
+- **Clickable links**: `make_links_clickable()` in `core.py` converts URLs in notes to `<a href>` tags. `disable_web_page_preview=True` on all report messages.
+- **Photos**: Stored as Telegram `file_id` in `request_photos` table. Displayed as `📎 Фото: N шт.` in reports. Viewing via inline buttons — access restricted to admins and request owners (IDOR protection).
+- **SOCKS5 proxy**: Optional, configured via `SOCKS5_PROXY` env var.
+- **CI/CD**: GitHub Actions runs flake8, black (`==26.5.1`), and pytest on every push/PR to `main`.
+
+## ConversationHandlers registration order (in `main()`)
+
+1. `register_conv` — `/start` for unregistered non-admin users (registration)
+2. `CommandHandler("start", start)` — `/start` for admins and registered users
+3. `requests_handler` — `📋 Заявки` button (admin: all requests with filters, card, delete)
+4. `analysis_handler` — `📊 Анализ` button
+5. `complete_handler` — `✅ Завершить заявку` button (with comment, pagination and batch complete)
+6. `status_handler` — `/status` command (admin: change request status)
+7. `my_requests_handler` — `📋 Мои заявки` button (with pagination and search)
+8. `admin_handler` — `⚙️ Настройки` button (backup, audit log, clear DB)
+9. `conv_handler` — `➕ Добавить заявку` button
+10. `CallbackQueryHandler(show_request_photos)` — photo viewing (with IDOR check)
+11. `CallbackQueryHandler(show_request_details)` — request details (with IDOR check)
+12. `MessageHandler(📊 Дашборд)` — dashboard for admins
+13. `handle_menu` — catch-all for remaining text (includes redirect to analysis and dashboard)
+
+**Important**: `start()` must return `ConversationHandler.END` for admins and registered users to avoid blocking subsequent handlers.
+
+## Notifications
+
+When a request is **created**:
+1. User confirmation with request details
+2. Shared chat (`TELEGRAM_CHAT_ID`) with inline button `📋 Открыть заявку #N`
+
+When a request is **completed** (single):
+1. Admin inline message with inline button `📋 Открыть заявку #N`
+2. Shared chat (`TELEGRAM_CHAT_ID`) with inline button
+3. Initiator personal message (if linked via `initiator_users` table) with inline button
+
+When requests are **batch-completed** (all on page):
+1. Admin inline message with count and actual IDs
+2. Shared chat (`TELEGRAM_CHAT_ID`) with summary notification
+
+Photos are NOT included in notifications.
+
+## Running
+
+```bash
+# Activate venv
+.venv\Scripts\activate        # Windows
+source .venv/bin/activate     # Linux/Mac
+
+# Run bot (creates bot.db automatically)
+python bot.py
+
+# Run tests
+python -m pytest tests/ -v
+
+# Lint and format
+flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+black --check --diff .
+```
+
+## Testing
+
+- **Framework**: pytest + pytest-asyncio
+- **Test runner**: `python -m pytest tests/ -v` (must use venv Python)
+- **DB tests**: `test_db.py` uses a `tmp_path` fixture with `patch.object(db, "DB_PATH", ...)` to isolate each test to a temporary database.
+- **Core tests**: `test_core.py` mocks `db.get_active_requests` and `db.get_photo_counts` to return fixture data.
+- **Bot tests**: `test_bot.py` mocks `db.get_all_lists`, `db.add_request_with_photos`, and `db.add_request_photo` to avoid real DB calls.
+- **Integration tests**: `test_integration.py` tests full conversation flows (create request, complete, register, cancel, rate limit, field limits).
+- **All 77 tests pass**.
+
+When adding new tests:
+- Async bot handlers: use `@pytest.mark.asyncio`, mock `update.message.reply_text` with `AsyncMock()`, mock `context.user_data` as a plain dict.
+- DB functions: use the `tmp_path` fixture pattern from `test_db.py`.
+
+## Common Pitfalls
+
+- **Import-time side effects**: `config.py` calls `_require_env()` at import time for mandatory vars. `_validate_config()` is called explicitly from `bot.py main()`. Tests set env vars in `conftest.py` before any imports.
+- **SQLite file locking**: Only one process should write to `bot.db` at a time. The `get_conn()` context manager uses WAL journal mode for better concurrency.
+- **SQLite placeholder limit**: `SQLITE_MAX_VARIABLE_NUMBER = 999`. Use batch queries (see `get_photo_counts()` for example).
+- **ConversationHandler fallbacks AND per-state cancel**: The `❌ Отмена` button is handled both via `MessageHandler(filters.Regex('^❌ Отмена$'), cancel)` in fallbacks AND via explicit per-state handlers in `NAME`, `QUANTITY`, `UNIT`, `INITIATOR`, `OBJECT`, `NOTES`, `ADMIN_RENAME_NEW`, `ADMIN_ADD_VALUE`. The per-state handlers prevent the broad `TEXT & ~COMMAND` catch-all from intercepting cancel as field input.
+- **Emoji in regex filters**: `⚙️` (U+2699 + U+FE0F variation selector) may arrive without the selector in Telegram messages. Use `filters.Regex('Настройки')` (match on text, not emoji) instead of `filters.Regex('^⚙️ Настройки$')`.
+- **Admin panel "Настройки" restart**: The `admin_handler` must include `MessageHandler(filters.Regex('Настройки'), admin_start)` in **fallbacks** (not just entry_points) so the button works when pressed while already inside the settings conversation.
+- **Admin panel "Назад" button**: `back_main` callback appears in both `ADMIN_MENU` and `ADMIN_LIST_VIEW` states. Both `admin_menu_handler` and `admin_list_view_handler` must handle it (use shared `_show_main_settings()` helper).
+- **PowerShell syntax**: On Windows, use `;` not `&&` to chain shell commands.
+- **New tables need fallback**: Functions accessing `settings` and `initiator_users` tables must use try/except to handle cases where the table doesn't exist yet (e.g., in tests with temporary DBs). See `get_setting()` and `get_initiator_by_tg_id()` for examples.
+- **callback_data uses numeric IDs**: List items in admin panel use numeric database IDs (`rename:42`, `del:42`, `confirm_del:42`) instead of truncated text values. This guarantees Telegram's 64-byte limit is never exceeded. Do NOT revert to text-based callbacks.
+- **Black formatting**: All Python files must pass `black --check`. Pin version in CI (`black==26.5.1`).
+
+## Files to Touch Together
+
+- Changing conversation flow → update `bot.py` (handlers + ConversationHandler states), `tests/test_bot.py`, and `tests/test_integration.py`
+- Changing report format → update `core.py` and `tests/test_core.py`
+- Changing DB schema → update `db.py` (schema + CRUD + migrations) and `tests/test_db.py`
+- Adding a new env var → add to `config.py`, update `.env.example` if present, update README.md
+- Changing default names or lists → update `_DEFAULT_LISTS` in `db.py` and fallbacks in `bot.py`
+- Changing CI workflow → update `.github/workflows/ci.yml`
+- Adding new ConversationHandler → register in `main()` in correct order (before catch-all `handle_menu`)
+
+## Security Notes
+
+### Secrets and configuration
+- `.env` is in `.gitignore` — never commit it.
+- `bot.db` is in `.gitignore` — it contains operational data, not code.
+- Telegram bot token gives full control over the bot. If exposed, revoke via @BotFather immediately.
+- `ADMIN_IDS` controls who can trigger analysis and manage settings. Non-numeric values are safely skipped at parse time. Validate before adding new admin-only features.
+- `initiator_users` table stores Telegram user IDs — treat as personal data.
+
+### Authorization
+- Every admin/complete handler re-checks `is_admin()` as defense-in-depth (not just the entry point).
+- `is_admin()` uses `update.effective_user.id` from Telegram server — cannot be spoofed via `callback_data`.
+- Registration checks `get_initiator_tg_id()` before linking — prevents hijacking an already-linked name. `link_initiator()` does NOT overwrite existing bindings (INSERT only, no UPSERT).
+- **IDOR protection**: `show_request_photos()` and `show_request_details()` verify `is_admin() or is_request_owner()` before returning data.
+- **Ownership check**: `is_request_owner(request_id, telegram_id)` in `db.py` verifies the user is the linked initiator of the request.
+
+### Race conditions
+- `update_request_status()` syncs `done_date` with status transitions: sets `today` when status changes to `done`, clears `done_date` when reopening from `done` to `new`/`ordered`/`delivered`.
+- `complete_request()` uses conditional `UPDATE ... WHERE id=? AND done_date IS NULL` with `rowcount` check to prevent double-completion by concurrent writers.
+- `complete_requests_batch()` uses a single `UPDATE ... WHERE id IN (...) AND done_date IS NULL` — atomic across all IDs.
+
+### HTML injection prevention
+- **All user-supplied fields** (`name`, `unit`, `initiator`, `object`, `notes`, `username`, DB list values) must be escaped with `html.escape()` before embedding in Telegram HTML messages (`parse_mode='HTML'`).
+- This applies in both `bot.py` (user messages) and `core.py` (reports).
+- Telegram's HTML parser supports `<a href>` — unescaped user input can inject phishing links.
+
+### Input validation
+- `validate_quantity()` rejects negative, zero, `inf`, and `NaN` values (`math.isfinite` check). Commas are normalized to dots before saving.
+- `bpr` setting is range-checked (1–6).
+- `callback_data` values use numeric list IDs (not truncated text) to fit Telegram's 64-byte limit.
+- `date.fromisoformat()` calls in `core.py` are wrapped in try/except to handle corrupt dates without crashing reports.
+- `_validate_config()` checks: `RATE_LIMIT_REQUESTS >= 1`, `RATE_LIMIT_WINDOW_SEC >= 1`, `MAX_FIELD_LENGTH >= 1`, `MAX_PHOTOS_PER_REQUEST` 1–10, `REPORT_HOUR` 0–23, `REPORT_MINUTE` 0–59, `OVERDUE_DAYS >= 1`.
+
+### Error handling
+- Exception messages are never shown to users — only generic messages. Full details go to `logger.error()` or `logger.warning()`.
+- Proxy URL credentials are masked before logging. HTTPX/HTTPcore loggers are set to WARNING level to prevent token leakage in INFO logs.
+- `context.user_data.clear()` is NOT called on save errors — user can retry with `🔄 Повторить`.
+- After successful SQL commit in `confirm_request()`, cleanup happens before notification delivery. If delivery fails, the request is already saved — no duplicate is created on retry.
+
+### Rate limiting
+- `RateLimiter` in `utils.py` implements per-user sliding window (default: 5 requests / 60 sec).
+- Auto-cleanup of stale user entries every 100 calls to prevent memory leaks.
+- Configurable via `RATE_LIMIT_REQUESTS` and `RATE_LIMIT_WINDOW_SEC` env vars.
+- Applied to `/start` and `➕ Добавить заявку` entry points.
+- `context.user_data["_saving"]` flag prevents double-submit on confirm.
+
+### Backup and audit
+- `backup_db()` creates a copy via SQLite backup API with UUID-enriched filenames to prevent collisions. Connections are closed in `finally` blocks.
+- `verify_backup()` opens the file in `mode=ro` (read-only), checks `PRAGMA integrity_check` AND verifies that key application tables (`requests`, `lists`, `request_photos`) exist. Rejects empty/corrupt databases.
+- `clear_all_requests()` **aborts if `backup_db()` returns `None`** (backup creation failed). Only proceeds after successful backup + verification.
+- `audit_log` table records all significant actions with user_id, action type, and details (created, completed, edited, status_changed, deleted, batch_completed, archived, db_cleared, list_added, list_deleted, list_renamed).
+- Admin panel includes `💾 Резервная копия` and `📋 Журнал действий` sections.
+
+### Persistent state
+- `conversation_state` table stores `user_data` as JSON at each conversation step.
+- `_save_draft()` called after each step; `clear_conversation_state()` on cancel/complete.
+- **Drafts survive bot restarts**: on `/start` → `➕ Добавить заявку`, the bot checks for a saved draft in `conversation_state` and offers the user to resume or start fresh. Draft data is restored into `context.user_data`.
+
+### DB migrations
+- `init_db()` creates base tables first, then runs column migrations, then creates indexes. This ensures old databases without the `status` column can be upgraded without errors.
+- Status column migration: `ALTER TABLE requests ADD COLUMN status TEXT DEFAULT 'new'` (only if column doesn't exist).
+- Unique index on `telegram_id`: `CREATE UNIQUE INDEX IF NOT EXISTS idx_initiator_tg_id ON initiator_users(telegram_id)`.
+- `archive_completed_requests()` uses `date('now', '-' || N || ' days')` for correct date arithmetic. Scheduled as a daily job at 03:00.
