@@ -1004,6 +1004,30 @@ def get_completed_requests(limit: int = 50) -> List[dict]:
     return [dict(r) for r in rows]
 
 
+def get_completed_requests_paginated(
+    limit: int = 8, offset: int = 0
+) -> Tuple[List[dict], int]:
+    """Пагинированная выборка выполненных заявок: (строки, всего).
+
+    Только status='done' (без архива и отменённых), полный охват всех
+    строк через COUNT + LIMIT/OFFSET — без скрытых лимитов.
+    """
+    with get_conn() as conn:
+        total = conn.execute(
+            "SELECT COUNT(*) FROM requests WHERE status = 'done' AND done_date IS NOT NULL"
+        ).fetchone()[0]
+        rows = conn.execute(
+            """SELECT id, name, quantity, unit, request_date, done_date,
+                      initiator, status, object, notes
+               FROM requests
+               WHERE status = 'done' AND done_date IS NOT NULL
+               ORDER BY done_date DESC, id DESC
+               LIMIT ? OFFSET ?""",
+            (limit, offset),
+        ).fetchall()
+    return [dict(r) for r in rows], int(total)
+
+
 def get_request_by_id(request_id: int) -> Optional[dict]:
     """Возвращает заявку по ID."""
     with get_conn() as conn:

@@ -75,6 +75,7 @@ from db import (
     complete_request,
     complete_requests_batch,
     cancel_request,
+    get_completed_requests_paginated,
     link_initiator,
     get_initiator_tg_id,
     get_initiator_by_tg_id,
@@ -2852,6 +2853,165 @@ async def cancel_confirm_handler(update: Update, context: ContextTypes.DEFAULT_T
     return None
 
 
+# ===== РАЗДЕЛ «✅ ВЫПОЛНЕННЫЕ ЗАЯВКИ» (админ) =====
+_COMPLETED_PAGE_SIZE = 8
+
+
+async def completed_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Вход в раздел «Выполненные заявки» (кнопка меню / inline)."""
+    if not is_admin(update.effective_user.id):
+        await _safe_reply(update, "⛔ Нет доступа.")
+        return None
+    return await _show_completed_page(update, context, 0)
+
+
+async def _show_completed_page(update_or_query, context, page: int):
+    """Компактный список выполненных с полной пагинацией (COUNT + OFFSET).
+
+    Возврат из карточки идёт по странице из callback_data, а не из
+    user_data — устаревшие сообщения и несколько открытых списков
+    не конфликтуют.
+    """
+    offset = max(0, page) * _COMPLETED_PAGE_SIZE
+    requests, total = get_completed_requests_paginated(
+        limit=_COMPLETED_PAGE_SIZE, offset=offset
+    )
+    total_pages = max(1, (total + _COMPLETED_PAGE_SIZE - 1) // _COMPLETED_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    if page * _COMPLETED_PAGE_SIZE != offset:
+        # Страница оказалась за пределами после клампа — перечитываем.
+        requests, total = get_completed_requests_paginated(
+            limit=_COMPLETED_PAGE_SIZE, offset=page * _COMPLETED_PAGE_SIZE
+        )
+
+    is_callback = isinstance(update_or_query, Update) and (
+        update_or_query.callback_query is not None
+    )
+
+    if not requests:
+        text = "✅ Нет выполненных заявок."
+        if is_callback:
+            await _safe_edit(update_or_query.callback_query, text)
+        else:
+            await _safe_reply(update_or_query, text)
+        return None
+
+    keyboard = []
+    for r in requests:
+        emoji = _status_emoji(r.get("status", "done"))
+        name = (r.get("name") or "")[:24]
+        obj = (r.get("object") or "—")[:10]
+        label = f"{emoji} #{r['id']} {name} ({obj})"
+        keyboard.append(
+            [InlineKeyboardButton(label, callback_data=f"cd:{page}:{r['id']}")]
+        )
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"cdp:{page - 1}"))
+    nav.append(
+        InlineKeyboardButton(
+            f"{page + 1}/{total_pages} · {total}", callback_data="cdnoop"
+        )
+    )
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"cdp:{page + 1}"))
+    keyboard.append(nav)
+
+    text = (
+        "✅ <b>Выполненные заявки</b>\n"
+        f"Всего: {total} · Страница {page + 1}/{total_pages}\n\n"
+        "Нажмите заявку для подробностей:"
+    )
+    markup = InlineKeyboardMarkup(keyboard)
+
+    if is_callback:
+        await _safe_edit(
+            update_or_query.callback_query, text, reply_markup=markup, parse_mode="HTML"
+        )
+    else:
+        await _safe_reply(update_or_query, text, reply_markup=markup, parse_mode="HTML")
+    return None
+
+
+async def completed_page_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """cdp:{page} — пагинация списка выполненных."""
+    query = update.callback_query
+    await _safe_answer(query)
+    if not is_admin(update.effective_user.id):
+        return None
+    page = int(query.data.split(":")[1])
+    return await _show_completed_page(update, context, page)
+
+
+async def completed_detail_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """cd:{page}:{id} — подробная карточка выполненной заявки."""
+    query = update.callback_query
+    await _safe_answer(query)
+    if not is_admin(update.effective_user.id):
+        await _safe_edit(query, "⛔ Нет доступа.")
+        return None
+    _, page_s, req_s = query.data.split(":")
+    page = int(page_s)
+    req_id = int(req_s)
+    req = get_request_by_id(req_id)
+    if not req:
+        await _safe_edit(query, "⚠️ Заявка не найдена.")
+        return None
+
+    qty_text = f"{req.get('quantity', '—')} {req.get('unit', '')}".strip()
+    status_label = STATUS_LABELS.get(req.get("status", "done"), req.get("status"))
+    notes = req.get("notes", "")
+    photos = get_request_photos(req_id)
+
+    text = (
+        f"✅ <b>Заявка #{req['id']}</b>\n\n"
+        f"📦 {escape(req.get('name', '—'))}\n"
+        f"🔢 <code>{escape(qty_text)}</code>\n"
+        f"👤 {escape(req.get('initiator', '—'))}\n"
+        f"🏗️ {escape(req.get('object', '—'))}\n"
+        f"📊 {status_label}\n"
+        f"📅 Создана: {escape(str(req.get('request_date', '—')))}\n"
+        f"📅 Выполнено: {escape(str(req.get('done_date', '—')))}"
+    )
+    if notes and notes != "-":
+        text += f"\n📝 {escape(notes)}"
+    if photos:
+        text += f"\n📎 Фото: {len(photos)} шт."
+
+    rows = []
+    if photos:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"📎 Фото ({len(photos)})", callback_data=f"photos:{req_id}"
+                )
+            ]
+        )
+    rows.append([InlineKeyboardButton("⬅️ К списку", callback_data=f"cdb:{page}")])
+    await _safe_edit(
+        query, text, reply_markup=InlineKeyboardMarkup(rows), parse_mode="HTML"
+    )
+    return None
+
+
+async def completed_back_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """cdb:{page} — возврат на прежнюю страницу списка."""
+    query = update.callback_query
+    await _safe_answer(query)
+    if not is_admin(update.effective_user.id):
+        return None
+    page = int(query.data.split(":")[1])
+    return await _show_completed_page(update, context, page)
+
+
+async def completed_noop_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """cdnoop — номер страницы без действия."""
+    query = update.callback_query
+    await _safe_answer(query)
+    return None
+
+
 # ===== СМЕНА СТАТУСА ЗАЯВКИ =====
 async def status_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Начинает диалог смены статуса заявки (для админов)"""
@@ -4765,6 +4925,22 @@ def register_handlers(app):
     )
     app.add_handler(
         CallbackQueryHandler(_flow_result(cancel_back_handler), pattern=r"^reqcxno$")
+    )
+
+    # --- Раздел «Выполненные заявки» (админ) ---
+    app.add_handler(
+        CallbackQueryHandler(_flow_result(completed_page_handler), pattern=r"^cdp:\d+$")
+    )
+    app.add_handler(
+        CallbackQueryHandler(
+            _flow_result(completed_detail_handler), pattern=r"^cd:\d+:\d+$"
+        )
+    )
+    app.add_handler(
+        CallbackQueryHandler(_flow_result(completed_back_handler), pattern=r"^cdb:\d+$")
+    )
+    app.add_handler(
+        CallbackQueryHandler(_flow_result(completed_noop_handler), pattern=r"^cdnoop$")
     )
 
     # --- Смена статуса (/status и карточки) ---

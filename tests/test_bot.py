@@ -701,3 +701,103 @@ async def test_complete_from_card_rejects_done_request(mock_get):
         for call in update.callback_query.edit_message_text.call_args_list
     ]
     assert any("нельзя завершить" in e or "Выполнена" in e for e in edits)
+
+
+# ===== B3: раздел «✅ Выполненные заявки» =====
+
+
+@pytest.mark.asyncio
+@patch("bot.get_completed_requests_paginated")
+@patch("bot.ADMIN_IDS", [123])
+async def test_completed_list_pagination(mock_paginated):
+    """Список выполненных: полная пагинация со счётчиком, без скрытых лимитов."""
+    from bot import _COMPLETED_PAGE_SIZE, completed_start
+
+    rows = [
+        {
+            "id": i,
+            "name": f"Заявка {i}",
+            "quantity": 1,
+            "unit": "шт",
+            "initiator": "Иван",
+            "object": "Склад",
+            "status": "done",
+            "done_date": "2026-01-10",
+            "request_date": "2026-01-01",
+            "notes": "",
+        }
+        for i in range(1, _COMPLETED_PAGE_SIZE + 1)
+    ]
+    mock_paginated.return_value = (rows, 12)
+
+    update = make_update(text="✅ Выполненные заявки", user_id=123)
+    context = make_context()
+    await completed_start(update, context)
+
+    # OFFSET учитывает страницу
+    assert mock_paginated.call_args.kwargs["offset"] == 0
+    assert mock_paginated.call_args.kwargs["limit"] == _COMPLETED_PAGE_SIZE
+
+    reply_kwargs = update.message.reply_text.call_args.kwargs
+    text = update.message.reply_text.call_args.args[0]
+    assert "Всего: 12" in text
+    assert "Страница 1/2" in text
+    datas = [
+        btn.callback_data
+        for row in reply_kwargs["reply_markup"].inline_keyboard
+        for btn in row
+    ]
+    # Строки карточек с номером страницы + переход на 2-ю страницу
+    assert "cd:0:1" in datas
+    assert "cd:0:8" in datas
+    assert "cdp:1" in datas
+
+
+@pytest.mark.asyncio
+@patch("bot.get_request_photos", return_value=["file1"])
+@patch("bot.get_request_by_id")
+@patch("bot.ADMIN_IDS", [123])
+async def test_completed_detail_back_keeps_page(mock_get, mock_photos):
+    """Кнопка «К списку» возвращает на страницу из callback_data."""
+    from bot import completed_detail_handler
+
+    mock_get.return_value = _active_row(status="done", done_date="2026-01-10")
+    update = make_callback_update("cd:1:5", user_id=123)
+    context = make_context()
+
+    await completed_detail_handler(update, context)
+
+    markup = update.callback_query.edit_message_text.call_args.kwargs["reply_markup"]
+    datas = [btn.callback_data for row in markup.inline_keyboard for btn in row]
+    assert "cdb:1" in datas  # прежняя страница, не 0
+    assert "photos:5" in datas
+
+
+@pytest.mark.asyncio
+@patch("bot.get_completed_requests_paginated", return_value=([], 0))
+@patch("bot.ADMIN_IDS", [123])
+async def test_completed_list_empty(mock_paginated):
+    """Пустой раздел показывает понятное сообщение."""
+    from bot import completed_start
+
+    update = make_update(text="✅ Выполненные заявки", user_id=123)
+    context = make_context()
+    await completed_start(update, context)
+
+    text = update.message.reply_text.call_args.args[0]
+    assert "Нет выполненных" in text
+
+
+@pytest.mark.asyncio
+@patch("bot.ADMIN_IDS", [123])
+async def test_completed_start_denied_for_user():
+    """Обычный пользователь не открывает раздел."""
+    from bot import completed_start
+
+    update = make_update(text="✅ Выполненные заявки", user_id=777)
+    context = make_context()
+    await completed_start(update, context)
+
+    text = update.message.reply_text.call_args.args[0]
+    assert "Нет доступа" in text
+    context.bot.send_message.assert_not_called()

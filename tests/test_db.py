@@ -28,6 +28,7 @@ from db import (
     get_request_by_id,
     get_requests_by_status,
     get_completed_requests,
+    get_completed_requests_paginated,
     get_dashboard_counts,
     get_user_requests,
     audit_log,
@@ -246,6 +247,31 @@ def test_complete_request_writes_audit():
     assert len(entries) == 1  # повторное завершение не дублирует audit
     assert entries[0]["user_id"] == 7
     assert entries[0]["details"] == "Дата: 2025-01-10"
+
+
+def test_get_completed_requests_paginated():
+    """B3: COUNT + LIMIT/OFFSET, только status='done', без скрытого лимита"""
+    # 12 выполненных
+    for i in range(12):
+        rid = add_request(f"Готово {i}", 1, "шт", date(2026, 1, 1), "И", "О")
+        complete_request(rid, date(2026, 1, 5))
+    # отменённая и активная не попадают в раздел
+    rid_c = add_request("Отменена", 1, "шт", date(2026, 1, 1), "И", "О")
+    cancel_request(rid_c, user_id=1, user_name="Тест")
+    add_request("Активна", 1, "шт", date(2026, 1, 1), "И", "О")
+
+    page0, total = get_completed_requests_paginated(limit=8, offset=0)
+    assert total == 12
+    assert len(page0) == 8
+
+    page1, total1 = get_completed_requests_paginated(limit=8, offset=8)
+    assert total1 == 12
+    assert len(page1) == 4
+
+    ids = {r["id"] for r in page0} | {r["id"] for r in page1}
+    assert rid_c not in ids
+    assert len(ids) == 12
+    assert all(r["status"] == "done" for r in page0 + page1)
 
 
 def test_update_request_status():
