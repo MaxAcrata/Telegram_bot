@@ -61,11 +61,19 @@ def test_is_admin_false():
 
 @patch("bot.ADMIN_IDS", [111])
 def test_get_main_keyboard_admin():
+    """B1: меню администратора без «Мои заявки»/«Заявки»/«Дашборд»."""
     kb = get_main_keyboard(111)
     text = str(kb)
     assert "📊 Анализ" in text
     assert "➕ Добавить заявку" in text
-    assert "📋 Мои заявки" in text
+    assert "✅ Выполненные заявки" in text
+    assert "✅ Завершить заявку" in text
+    assert "⚙️ Настройки" in text
+    assert "⛔ Выход" in text
+    # Убраны из клавиатуры (обработка текста сохранена для легаси)
+    assert "📋 Мои заявки" not in text
+    assert "📋 Заявки" not in text
+    assert "📊 Дашборд" not in text
 
 
 @patch("bot.ADMIN_IDS", [111])
@@ -801,3 +809,40 @@ async def test_completed_start_denied_for_user():
     text = update.message.reply_text.call_args.args[0]
     assert "Нет доступа" in text
     context.bot.send_message.assert_not_called()
+
+
+# ===== B1/B7: меню и Анализ =====
+
+
+@pytest.mark.asyncio
+@patch("bot.ADMIN_IDS", [123])
+async def test_analysis_offers_three_modes():
+    """Анализ: Актуальные / Выполненные / Отменённые."""
+    from bot import analysis_start
+
+    update = make_update(text="📊 Анализ", user_id=123)
+    context = make_context()
+    await analysis_start(update, context)
+
+    markup = update.message.reply_text.call_args.kwargs["reply_markup"]
+    datas = [btn.callback_data for row in markup.inline_keyboard for btn in row]
+    assert "report:active" in datas
+    assert "report:completed" in datas
+    assert "report:cancelled" in datas
+
+
+@pytest.mark.asyncio
+@patch("bot._show_requests_list", new_callable=AsyncMock)
+@patch("bot.ADMIN_IDS", [123])
+async def test_analysis_cancelled_opens_filteredList(mock_list):
+    """«Отменённые» в Анализе открывает список-секцию с фильтром."""
+    from bot import analysis_filter_handler
+
+    mock_list.return_value = None
+    update = make_callback_update("report:cancelled", user_id=123)
+    context = make_context()
+
+    await analysis_filter_handler(update, context)
+
+    assert context.user_data["req_filter"] == "cancelled"
+    mock_list.assert_called_once()

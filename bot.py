@@ -530,17 +530,15 @@ def _user_name(update: Update) -> str:
 def get_main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
     """Возвращает главную клавиатуру в зависимости от прав"""
     if is_admin(user_id):
-        # Админское меню с логической группировкой
+        # Меню администратора (B1): «Мои заявки», «Заявки» и «Дашборд»
+        # убраны; доступ к спискам и фильтрам — через «📊 Анализ» и
+        # раздел «✅ Выполненные заявки». Старые кнопки продолжают
+        # обрабатываться роутером для легаси-клавиатур.
         keyboard = [
-            # Основные действия
-            ["➕ Добавить заявку", "📋 Мои заявки"],
-            # Управление заявками
-            ["📋 Заявки", "✅ Завершить заявку"],
-            # Аналитика
-            ["📊 Дашборд", "📊 Анализ"],
-            # Настройки
+            ["➕ Добавить заявку"],
+            ["📊 Анализ", "✅ Выполненные заявки"],
+            ["✅ Завершить заявку"],
             ["⚙️ Настройки"],
-            # Выход
             ["⛔ Выход"],
         ]
     else:
@@ -2163,6 +2161,9 @@ async def analysis_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("📋 Актуальные", callback_data="report:active"),
             InlineKeyboardButton("✅ Выполненные", callback_data="report:completed"),
         ],
+        [
+            InlineKeyboardButton("🚫 Отменённые", callback_data="report:cancelled"),
+        ],
     ]
     await _safe_reply(
         update,
@@ -2173,10 +2174,19 @@ async def analysis_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def analysis_filter_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Генерирует отчёт по выбранному фильтру"""
+    """Отчёт по фильтру; «Отменённые» — компактный список с карточками."""
     query = update.callback_query
     await _safe_answer(query)
     mode = query.data.split(":")[1]
+
+    if mode == "cancelled":
+        # Заменяющий путь к отменённым и фильтрам раздела «Заявки»:
+        # каждая заявка открывается карточкой (rc:{id}), доступны
+        # фильтры, смена статуса и административные действия.
+        if not is_admin(update.effective_user.id):
+            return None
+        context.user_data["req_filter"] = "cancelled"
+        return await _show_requests_list(update, context, 0)
 
     await _safe_edit(query, "⏳ Формирую отчёт...")
 
@@ -3296,6 +3306,7 @@ _MENU_BUTTONS = {
     "📊 Анализ",
     "📊 Дашборд",
     "✅ Завершить заявку",
+    "✅ Выполненные заявки",
     "⚙️ Настройки",
     "⛔ Выход",
 }
@@ -3915,6 +3926,8 @@ async def _dispatch_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, lab
         handler, flow = complete_start, "complete"
     elif label == "📊 Анализ":
         handler = analysis_start
+    elif label == "✅ Выполненные заявки":
+        handler = completed_start
     elif label == "📊 Дашборд":
         handler = dashboard_start
     elif label == "⚙️ Настройки":
@@ -5046,7 +5059,7 @@ def register_handlers(app):
     app.add_handler(
         CallbackQueryHandler(
             _flow_result(analysis_filter_handler),
-            pattern=r"^report:(active|completed)$",
+            pattern=r"^report:(active|completed|cancelled)$",
         )
     )
     app.add_handler(
