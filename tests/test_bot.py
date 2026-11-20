@@ -83,16 +83,35 @@ def test_get_main_keyboard_user():
 @pytest.mark.asyncio
 @patch("bot.clear_conversation_state")
 @patch("bot.ADMIN_IDS", [123])
-async def test_cancel_clears_user_data(mock_clear):
+async def test_cancel_in_create_flow_clears_draft_and_form(mock_clear):
+    """Явная отмена внутри создания чистит память формы и conversation_state."""
     update = make_update(user_id=123)
     context = make_context()
-    context.user_data["name"] = "test"
+    context.user_data.update({"_flow": "create", "_step": NAME, "name": "test"})
 
     result = await cancel(update, context)
 
     assert result == ConversationHandler.END
     assert context.user_data == {}
     mock_clear.assert_called_once_with(123)
+
+
+@pytest.mark.asyncio
+@patch("bot.clear_conversation_state")
+@patch("bot.ADMIN_IDS", [123])
+async def test_cancel_outside_create_keeps_conversation_state(mock_clear):
+    """Отмена вне создания не удаляет персистентный черновик."""
+    update = make_update(user_id=123)
+    context = make_context()
+    context.user_data["complete_request"] = {"id": 1}
+    context.user_data["name"] = "leftover"
+
+    result = await cancel(update, context)
+
+    assert result == ConversationHandler.END
+    assert context.user_data == {}
+    # conversation_state не трогаем: черновик другого назначения цел
+    mock_clear.assert_not_called()
 
 
 # ===== Тесты начала диалога =====
@@ -300,58 +319,68 @@ async def test_set_name_accepts_real_text(mock_draft, mock_save, mock_clear):
 
 @pytest.mark.asyncio
 @patch("bot.is_admin", return_value=True)
-@patch("bot._safe_edit", new_callable=AsyncMock)
 @patch("bot._safe_reply", new_callable=AsyncMock)
 @patch("bot.complete_comment_text_handler", new_callable=AsyncMock)
-async def test_complete_text_router_accepts_comment(
-    mock_handler, mock_reply, mock_edit, mock_admin
+async def test_route_text_dispatches_comment_in_complete_flow(
+    mock_handler, mock_reply, mock_admin
 ):
-    """Текст при complete_request в user_data уходит в comment handler."""
-    from bot import complete_text_router
+    """Текст при _flow=complete/COMPLETE_COMMENT уходит в comment handler."""
+    from bot import route_text, COMPLETE_COMMENT
 
-    mock_handler.return_value = 51  # COMPLETE_CONFIRM-like
+    mock_handler.return_value = 51  # COMPLETE_CONFIRM
     update = make_update(text="Готово к отгрузке")
     context = make_context()
     context.user_data["complete_request"] = {"id": 1, "name": "Цемент"}
+    context.user_data["_flow"] = "complete"
+    context.user_data["_step"] = COMPLETE_COMMENT
 
-    result = await complete_text_router(update, context)
+    await route_text(update, context)
 
     mock_handler.assert_called_once()
-    assert result == 51
+    # Результат применён: шаг обновлён
+    assert context.user_data["_step"] == 51
 
 
 @pytest.mark.asyncio
 @patch("bot.is_admin", return_value=True)
 @patch("bot.complete_comment_text_handler", new_callable=AsyncMock)
-async def test_complete_text_router_ignores_menu(mock_handler, mock_admin):
-    """Кнопки меню не должны съедаться как комментарий."""
-    from bot import complete_text_router
+@patch("bot.start_add_request", new_callable=AsyncMock)
+async def test_route_text_menu_not_eaten_as_comment(mock_add, mock_handler, mock_admin):
+    """Кнопки меню не съедаются как комментарий: сценарий прерывается."""
+    from bot import route_text, COMPLETE_COMMENT
 
+    mock_add.return_value = None
     update = make_update(text="➕ Добавить заявку")
     context = make_context()
     context.user_data["complete_request"] = {"id": 1}
+    context.user_data["_flow"] = "complete"
+    context.user_data["_step"] = COMPLETE_COMMENT
 
-    result = await complete_text_router(update, context)
+    result = await route_text(update, context)
 
     mock_handler.assert_not_called()
+    mock_add.assert_called_once()
     assert result is None
     assert "complete_request" not in context.user_data
+    assert "_flow" not in context.user_data
 
 
 @pytest.mark.asyncio
 @patch("bot.is_admin", return_value=True)
 @patch("bot.complete_comment_text_handler", new_callable=AsyncMock)
-async def test_complete_text_router_no_request(mock_handler, mock_admin):
-    """Без complete_request роутер не трогает текст (пусть handle_menu)."""
-    from bot import complete_text_router
+@patch("bot._safe_reply", new_callable=AsyncMock)
+async def test_route_text_no_flow_generic_hint(mock_reply, mock_handler, mock_admin):
+    """Без активного сценария текст не уходит в comment handler."""
+    from bot import route_text
 
     update = make_update(text="Привет")
     context = make_context()
 
-    result = await complete_text_router(update, context)
+    result = await route_text(update, context)
 
     mock_handler.assert_not_called()
     assert result is None
+    mock_reply.assert_called_once()
 
 
 # ===== Автоотчёт =====

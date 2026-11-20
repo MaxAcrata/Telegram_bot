@@ -1,8 +1,10 @@
 import asyncio
+import functools
 import json
 import logging
 from time import monotonic as _monotonic
 from typing import Awaitable, Callable, NamedTuple, Optional
+from uuid import uuid4
 
 # Маркер сборки — виден в логах Amvera, чтобы понимать, какая версия запущена.
 APP_VERSION = "2026-10-22.a4af99e"
@@ -122,19 +124,6 @@ async def handle_non_text_hint(update: Update, context: ContextTypes.DEFAULT_TYP
     return None  # не меняем состояние ConversationHandler
 
 
-def non_text_hint_for(state):
-    """Хендлер-заглушка: отклоняет не-текст и остаётся в state."""
-
-    async def _hint(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await _safe_reply(
-            update,
-            "✏️ Отправьте текстовое сообщение (не файл, гифку или стикер).",
-        )
-        return state
-
-    return _hint
-
-
 def _message_text(update: Update) -> str:
     """Текст сообщения или '' (для гифок/стикеров/файлов)."""
     return (update.message.text or "").strip() if update.message else ""
@@ -143,49 +132,6 @@ def _message_text(update: Update) -> str:
 async def _reject_blank_text(update: Update, prompt: str, state):
     await _safe_reply(update, prompt, reply_markup=CANCEL_KEYBOARD)
     return state
-
-
-async def complete_text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ловит текст комментария, если ConversationHandler потерял state."""
-    if not context.user_data.get("complete_request"):
-        return
-    if not is_admin(update.effective_user.id):
-        return
-    text = _message_text(update)
-    # Кнопки меню / отмена — не перехватываем, сбрасываем flow
-    menu_markers = (
-        "➕ Добавить заявку",
-        "✅ Завершить заявку",
-        "📋 Заявки",
-        "📋 Мои заявки",
-        "📊 Анализ",
-        "📊 Дашборд",
-        "⚙️ Настройки",
-        "⛔ Выход",
-        "❌ Отмена",
-        "/start",
-    )
-    if text in menu_markers:
-        context.user_data.pop("complete_request", None)
-        context.user_data.pop("complete_comment", None)
-        return
-    return await complete_comment_text_handler(update, context)
-
-
-async def complete_select_text_hint(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Текст вместо выбора заявки кнопкой."""
-    if context.user_data.get("complete_request"):
-        return await complete_comment_text_handler(update, context)
-    await _safe_reply(update, "👆 Выберите заявку кнопкой из списка.")
-    return COMPLETE_SELECT
-
-
-async def complete_confirm_text_hint(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-):
-    """Текст вместо кнопки подтверждения."""
-    await _safe_reply(update, "👆 Подтвердите или отмените кнопкой.")
-    return COMPLETE_CONFIRM
 
 
 # ===== СОСТОЯНИЯ CONVERSATION =====
@@ -234,6 +180,321 @@ EDIT_SELECT_FIELD, EDIT_INPUT_VALUE = 140, 141
 
 # ===== СОСТОЯНИЯ УДАЛЕНИЯ ЗАЯВКИ =====
 DELETE_CONFIRM = 145
+
+# ===== ИНФРАСТРУКТУРА ЕДИНОГО ТЕКСТОВОГО РОУТЕРА =====
+# Сценарии хранятся в user_data как _flow/_step; ConversationHandler
+# как оркестратор не используется (END остаётся лишь константой-сентинелом).
+
+# Ключи данных формы создания заявки (память сценария).
+_CREATE_MEMORY_KEYS = frozenset(
+    {
+        "draft_id",
+        "name",
+        "quantity",
+        "unit",
+        "initiator",
+        "object",
+        "notes",
+        "photos",
+        "photo_file_ids",
+        "pending_draft",
+        "_saving",
+    }
+)
+
+# Временные ключи всех сценариев (очистка при abort/меню/тайм-ауте).
+_FLOW_TEMP_KEYS = frozenset(
+    {
+        "complete_request",
+        "complete_comment",
+        "complete_requests",
+        "awaiting_search",
+        "my_requests",
+        "my_page",
+        "status_request",
+        "status_requests",
+        "card_request",
+        "edit_request",
+        "edit_field",
+        "edit_fields_order",
+        "edit_current_index",
+        "delete_request",
+        "admin_list_type",
+        "admin_rename_old",
+        "admin_delete_value",
+        "req_filter",
+        "cd_page",
+        "_flow",
+        "_step",
+        "_flow_token",
+        "_timeout_job",
+    }
+)
+
+# Допустимые шаги каждого сценария (для проверки результатов обработчиков).
+_FLOW_STEPS = {
+    "create": {
+        NAME,
+        QUANTITY,
+        UNIT,
+        INITIATOR,
+        INITIATOR_CUSTOM,
+        OBJECT,
+        OBJECT_CUSTOM,
+        NOTES,
+        PHOTO,
+        CONFIRM,
+    },
+    "register": {REG_NAME},
+    "complete": {COMPLETE_SELECT, COMPLETE_COMMENT, COMPLETE_CONFIRM},
+    "my_search": {MY_REQUESTS_SELECT},
+    "edit": {EDIT_INPUT_VALUE},
+    "admin": {
+        ADMIN_MENU,
+        ADMIN_LIST_VIEW,
+        ADMIN_RENAME_NEW,
+        ADMIN_ADD_VALUE,
+        ADMIN_DELETE,
+        ADMIN_BUTTONS_EDIT,
+        ADMIN_CLEAR_DB_CONFIRM,
+    },
+}
+
+# Шаги, ожидающие ввод текста: для них действует conversation timeout.
+_TEXT_FLOW_STEPS = {
+    "create": {
+        NAME,
+        QUANTITY,
+        UNIT,
+        INITIATOR,
+        INITIATOR_CUSTOM,
+        OBJECT,
+        OBJECT_CUSTOM,
+        NOTES,
+        PHOTO,
+        CONFIRM,
+    },
+    "register": {REG_NAME},
+    "complete": {COMPLETE_COMMENT},
+    "my_search": set(),  # поиск включается кнопкой mrsearch — там и ставится таймер
+    "edit": {EDIT_INPUT_VALUE},
+    "admin": {ADMIN_RENAME_NEW, ADMIN_ADD_VALUE},
+}
+
+
+def _end_flow(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Завершает активный сценарий: таймер, _flow/_step/_flow_token."""
+    job = context.user_data.pop("_timeout_job", None)
+    if job is not None:
+        try:
+            job.schedule_removal()
+        except Exception:  # pragma: no cover - job уже мог быть удалён
+            pass
+    context.user_data.pop("_flow", None)
+    context.user_data.pop("_step", None)
+    context.user_data.pop("_flow_token", None)
+
+
+def _clear_create_memory(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Удаляет поля формы создания из памяти (черновик БД не трогает)."""
+    for key in _CREATE_MEMORY_KEYS:
+        context.user_data.pop(key, None)
+
+
+def _abort_flow(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    preserve_persistent_draft: bool = True,
+    user_id: Optional[int] = None,
+) -> None:
+    """Завершает сценарий и чистит временные данные.
+
+    preserve_persistent_draft=False — явная отмена создания: дополнительно
+    удаляются поля формы и запись conversation_state.
+    """
+    _end_flow(context)
+    for key in _FLOW_TEMP_KEYS:
+        context.user_data.pop(key, None)
+    context.user_data.pop("_saving", None)
+    if not preserve_persistent_draft:
+        _clear_create_memory(context)
+        if user_id is not None:
+            clear_conversation_state(user_id)
+
+
+def _disarm_timeout(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Отменяет активный job тайм-аута (если есть)."""
+    job = context.user_data.get("_timeout_job")
+    if job is not None:
+        try:
+            job.schedule_removal()
+        except Exception:  # pragma: no cover
+            pass
+        context.user_data.pop("_timeout_job", None)
+
+
+def _arm_timeout(
+    context: ContextTypes.DEFAULT_TYPE,
+    update=None,
+    *,
+    chat_id: Optional[int] = None,
+    user_id: Optional[int] = None,
+) -> None:
+    """Планирует тайм-аут текстового шага с уникальным flow_token."""
+    if update is not None:
+        chat = getattr(update, "effective_chat", None)
+        user = getattr(update, "effective_user", None)
+        chat_id = getattr(chat, "id", chat_id)
+        user_id = getattr(user, "id", user_id)
+    if chat_id is None or user_id is None:
+        return
+    _disarm_timeout(context)
+    token = uuid4().hex
+    context.user_data["_flow_token"] = token
+    job = context.job_queue.run_once(
+        on_flow_timeout,
+        CONVERSATION_TIMEOUT_SEC,
+        chat_id=chat_id,
+        user_id=user_id,
+        data={
+            "user_id": user_id,
+            "chat_id": chat_id,
+            "flow_token": token,
+        },
+        name=f"flow_timeout:{chat_id}:{user_id}",
+    )
+    context.user_data["_timeout_job"] = job
+
+
+async def on_flow_timeout(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Срабатывает по тайм-ауту: чистит сценарий конкретного пользователя.
+
+    Вызывается JobQueue без Update — идентификаторы берём из job.
+    Устаревший job (другой flow_token) ничего не делает.
+    """
+    job = context.job
+    data = job.data or {}
+    user_id = data.get("user_id")
+    chat_id = data.get("chat_id")
+    token = data.get("flow_token")
+    if user_id is None or chat_id is None:
+        return
+    if context.user_data.get("_flow_token") != token:
+        # Устаревший таймер: сценарий уже завершён или перезапущен.
+        return
+    flow_before = context.user_data.get("_flow")
+    _abort_flow(context, preserve_persistent_draft=True, user_id=user_id)
+    # Поля формы — из памяти; запись conversation_state (черновик) остаётся.
+    _clear_create_memory(context)
+    _log_op(
+        "conversation_timeout",
+        user_id=user_id,
+        chat_id=chat_id,
+        state_before=flow_before,
+        state_after=None,
+        flow=flow_before,
+    )
+    await _safe_send(
+        context,
+        chat_id,
+        "⏳ Операция прервана по тайм-ауту бездействия.\n"
+        "Начните заново — я вернул вас в главное меню.",
+        reply_markup=get_main_keyboard(user_id),
+    )
+
+
+def _set_flow_step(
+    context: ContextTypes.DEFAULT_TYPE,
+    flow: str,
+    step: Optional[int] = None,
+    *,
+    update=None,
+    arm: Optional[bool] = None,
+) -> None:
+    """Устанавливает активный сценарий и шаг (с тайм-аутом при необходимости).
+
+    При смене сценария чужой активный сценарий безопасно завершается:
+    персистентный черновик создания уже сохранён пошагово (_save_draft).
+    """
+    current = context.user_data.get("_flow")
+    if current is not None and current != flow:
+        _abort_flow(context, preserve_persistent_draft=True)
+        if current == "create":
+            # Поля формы — в памяти; запись conversation_state остаётся.
+            _clear_create_memory(context)
+    context.user_data["_flow"] = flow
+    if step is not None:
+        context.user_data["_step"] = step
+    effective_step = context.user_data.get("_step")
+    is_text_step = effective_step in _TEXT_FLOW_STEPS.get(flow, set())
+    if arm is None:
+        arm = is_text_step
+    if arm:
+        _arm_timeout(context, update)
+    else:
+        _disarm_timeout(context)
+
+
+def _apply_step_result(
+    context: ContextTypes.DEFAULT_TYPE,
+    result,
+    *,
+    update=None,
+    flow: Optional[str] = None,
+) -> None:
+    """Переносит результат обработчика в _flow/_step.
+
+    - int >= 0 и допустимый для сценария → новый шаг (+ тайм-аут по правилам);
+    - ConversationHandler.END → завершение сценария;
+    - None / недопустимый для сценария результат → без изменений.
+    """
+    if result is None:
+        # Обработчик ничего не вернул: состояние сценария не меняем.
+        return
+    if result == ConversationHandler.END:
+        _end_flow(context)
+        return
+    if not isinstance(result, int) or isinstance(result, bool):
+        return
+    active_flow = context.user_data.get("_flow") or flow
+    if active_flow is None:
+        return  # inline-секция без сценария: псевдосостояния игнорируются
+    valid_steps = _FLOW_STEPS.get(active_flow, set())
+    if result not in valid_steps:
+        return  # чужой/устаревший результат — не портим активный сценарий
+    context.user_data["_flow"] = active_flow
+    context.user_data["_step"] = result
+    if result in _TEXT_FLOW_STEPS.get(active_flow, set()):
+        _arm_timeout(context, update)
+    else:
+        _disarm_timeout(context)
+
+
+def _flow_result(func):
+    """Оборачивает callback-обработчик: переносит его результат в _flow/_step."""
+
+    @functools.wraps(func)
+    async def wrapper(update, context):
+        result = await func(update, context)
+        _apply_step_result(context, result, update=update)
+        return result
+
+    return wrapper
+
+
+def _normalize_text(text: str) -> str:
+    """Нормализует текст для сравнения (вариант-селектор U+FE0F и т.п.)."""
+    return text.replace("\ufe0f", "").strip()
+
+
+def _menu_label(text: str) -> Optional[str]:
+    """Возвращает каноническую метку кнопки главного меню или None."""
+    normalized = _normalize_text(text)
+    for label in _MENU_BUTTONS:
+        if _normalize_text(label) == normalized:
+            return label
+    return None
+
 
 # ===== КЛАВИАТУРЫ =====
 CANCEL_KEYBOARD = ReplyKeyboardMarkup(
@@ -815,9 +1076,18 @@ async def show_request_details(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # ===== КОМАНДЫ =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /start"""
+    """Команда /start.
+
+    Завершает все временные сценарии пользователя, очищает поля формы из
+    памяти, но НЕ удаляет сохранённый черновик в conversation_state.
+    """
     user_id = update.effective_user.id
     username = update.effective_user.first_name or "пользователь"
+
+    # Останавливает любые активные сценарии (включая чужие по отношению
+    # к /start) и чистит временные ключи; черновик БД не затрагивается.
+    _abort_flow(context, preserve_persistent_draft=True)
+    _clear_create_memory(context)
 
     # Проверяем rate limit
     if not rate_limiter.is_allowed(user_id):
@@ -857,7 +1127,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return ConversationHandler.END
         else:
-            return await register_start(update, context)
+            # Регистрация — тоже сценарий: фиксируем _flow/_step явно,
+            # так как CommandHandler не запоминает состояния.
+            result = await register_start(update, context)
+            if isinstance(result, int) and result >= 0:
+                _set_flow_step(context, "register", result, update=update)
+            return result
 
 
 async def register_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1826,10 +2101,20 @@ async def confirm_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Отменяет текущую операцию"""
+    """Отменяет только текущую операцию и возвращает главное меню.
+
+    Внутри создания — очищаются память формы и conversation_state;
+    в остальных сценариях персистентный черновик не затрагивается.
+    """
     user_id = update.effective_user.id
-    context.user_data.clear()
-    clear_conversation_state(user_id)
+    flow = context.user_data.get("_flow")
+    if flow == "create":
+        _abort_flow(context, preserve_persistent_draft=False, user_id=user_id)
+    else:
+        _abort_flow(context, preserve_persistent_draft=True)
+        # Поля формы убираем и вне создания: чужие ключи сценариев уже
+        # очищены, черновик БД (если был) остаётся нетронутым.
+        _clear_create_memory(context)
 
     await _safe_reply(
         update, "❌ Операция отменена.", reply_markup=get_main_keyboard(user_id)
@@ -1900,6 +2185,9 @@ async def complete_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _safe_reply(update, "⛔ Нет доступа.")
         return ConversationHandler.END
 
+    # Переключение сценария ДО записи ключей списка (abort чужого сценария).
+    _set_flow_step(context, "complete", COMPLETE_SELECT, update=update)
+
     requests = get_active_requests()
     if not requests:
         await _safe_reply(update, "✅ Нет активных заявок для завершения.")
@@ -1966,6 +2254,8 @@ async def _show_complete_page(update_or_query, context, page: int):
     elif hasattr(update_or_query, "message"):
         await _safe_reply(update_or_query, text, reply_markup=markup, parse_mode="HTML")
 
+    # Источник истины входа в сценарий завершения (в т.ч. из callback crnoop).
+    _set_flow_step(context, "complete", COMPLETE_SELECT, update=update_or_query)
     return COMPLETE_SELECT
 
 
@@ -2037,6 +2327,7 @@ async def complete_batch_handler(update: Update, context: ContextTypes.DEFAULT_T
             )
 
     context.user_data.pop("complete_requests", None)
+    _end_flow(context)
     return ConversationHandler.END
 
 
@@ -2046,7 +2337,10 @@ async def complete_select_handler(update: Update, context: ContextTypes.DEFAULT_
         return ConversationHandler.END
     query = update.callback_query
     await _safe_answer(query)
+    # Переключение сценария ДО записи ключей: abort чужого сценария не
+    # должен стирать данные завершения. Черновик создания уже в БД.
     req_id = int(query.data.split(":")[1])
+    _set_flow_step(context, "complete", COMPLETE_COMMENT, update=update)
 
     selected = get_request_by_id(req_id)
     if not selected or selected.get("done_date"):
@@ -2087,6 +2381,7 @@ async def complete_comment_handler(update: Update, context: ContextTypes.DEFAULT
         await _safe_answer(query)
         context.user_data.pop("complete_request", None)
         context.user_data.pop("complete_comment", None)
+        _end_flow(context)
         await _safe_edit(query, "❌ Отменено.")
         return ConversationHandler.END
 
@@ -2176,6 +2471,8 @@ async def _show_complete_final(query, context):
     await _safe_edit(
         query, text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML"
     )
+    # Шаг подтверждения — inline-кнопки; таймер ожидания текста снимаем.
+    _set_flow_step(context, "complete", COMPLETE_CONFIRM)
     return COMPLETE_CONFIRM
 
 
@@ -2190,6 +2487,7 @@ async def complete_confirm_handler(update: Update, context: ContextTypes.DEFAULT
     if data == "cr:cancel":
         context.user_data.pop("complete_request", None)
         context.user_data.pop("complete_comment", None)
+        _end_flow(context)
         await _safe_edit(query, "❌ Отменено.")
         return ConversationHandler.END
 
@@ -2279,6 +2577,7 @@ async def complete_confirm_handler(update: Update, context: ContextTypes.DEFAULT
 
     context.user_data.pop("complete_request", None)
     context.user_data.pop("complete_comment", None)
+    _end_flow(context)
     return ConversationHandler.END
 
 
@@ -2551,6 +2850,9 @@ async def my_requests_search_handler(
     """Запрашивает поисковый запрос"""
     query = update.callback_query
     await _safe_answer(query)
+    # Сначала переключение сценария (abort чужого не сотрёт новые ключи),
+    # затем установка флага ожидания текста — включаем conversation timeout.
+    _set_flow_step(context, "my_search", MY_REQUESTS_SELECT, update=update, arm=True)
     await _safe_edit(query, "🔍 Введите поисковый запрос (наименование или фрагмент):")
     context.user_data["awaiting_search"] = True
     return MY_REQUESTS_SELECT
@@ -2571,28 +2873,12 @@ _MENU_BUTTONS = {
 async def my_requests_search_text_handler(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ):
-    """Обрабатывает текст поиска"""
+    """Обрабатывает текст поиска.
+
+    Кнопки главного меню сюда не попадают: их первым перехватывает
+    route_text и переключает раздел.
+    """
     text = _message_text(update)
-
-    # Если пользователь нажал кнопку меню — выходим из диалога
-    if text in _MENU_BUTTONS:
-        # Сначала выходим из диалога
-        context.user_data.pop("my_requests", None)
-        context.user_data.pop("my_page", None)
-        context.user_data.pop("awaiting_search", None)
-
-        # Затем обрабатываем кнопку меню
-        if text == "📊 Анализ":
-            return await analysis_start(update, context)
-        elif text == "📊 Дашборд":
-            return await dashboard_start(update, context)
-        else:
-            await _safe_reply(
-                update,
-                "↩️ Вышли из «Моих заявок». Нажмите кнопку ещё раз.",
-                reply_markup=get_main_keyboard(update.effective_user.id),
-            )
-            return ConversationHandler.END
 
     if not context.user_data.get("awaiting_search"):
         await _safe_reply(
@@ -2697,6 +2983,8 @@ async def admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return await _show_main_settings(query)
 
     list_type = data.split(":")[1]
+    # Открываем раздел справочника: сценарий фиксируется до записи ключей.
+    _set_flow_step(context, "admin", ADMIN_LIST_VIEW, update=update)
     context.user_data["admin_list_type"] = list_type
     return await _show_list(update, context, list_type)
 
@@ -2810,6 +3098,9 @@ async def admin_list_view_handler(update: Update, context: ContextTypes.DEFAULT_
     list_type = context.user_data.get("admin_list_type", "object")
 
     if data == "add":
+        # Переключение сценария до записи ключей (abort чужого сценария).
+        _set_flow_step(context, "admin", ADMIN_ADD_VALUE, update=update, arm=True)
+        context.user_data["admin_list_type"] = list_type
         await _safe_edit(
             query,
             f"✍️ Введите новое значение для <b>{LIST_TYPE_LABELS.get(list_type, list_type)}</b>:",
@@ -2824,6 +3115,9 @@ async def admin_list_view_handler(update: Update, context: ContextTypes.DEFAULT_
             await _safe_edit(query, "⚠️ Значение не найдено.")
             return ADMIN_LIST_VIEW
         old_value = item["value"]
+        # Переключение сценария до записи ключей (abort чужого сценария).
+        _set_flow_step(context, "admin", ADMIN_RENAME_NEW, update=update, arm=True)
+        context.user_data["admin_list_type"] = list_type
         context.user_data["admin_rename_old"] = old_value
         await _safe_edit(
             query,
@@ -3132,8 +3426,11 @@ async def admin_clear_db_execute(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def admin_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Выход из админ-панели"""
-    context.user_data.clear()
+    """Выход из админ-панели: закрывает только текущую операцию."""
+    context.user_data.pop("admin_list_type", None)
+    context.user_data.pop("admin_rename_old", None)
+    context.user_data.pop("admin_delete_value", None)
+    _end_flow(context)
     user_id = update.effective_user.id
     await _safe_reply(
         update, "❌ Настройки закрыты.", reply_markup=get_main_keyboard(user_id)
@@ -3141,30 +3438,172 @@ async def admin_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-# ===== ОБРАБОТКА ГЛАВНОГО МЕНЮ =====
-async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает кнопки главного меню"""
-    text = _message_text(update)
-    user_id = update.effective_user.id
+# ===== ГЛАВНЫЙ ТЕКСТОВЫЙ РОУТЕР =====
+# Диспетчеры шагов создания (определения функций уже выше по модулю).
+_CREATE_TEXT_HANDLERS = {
+    NAME: set_name,
+    QUANTITY: set_quantity,
+    UNIT: set_unit,
+    INITIATOR: set_initiator,
+    INITIATOR_CUSTOM: set_initiator_custom,
+    OBJECT: set_object,
+    OBJECT_CUSTOM: set_object_custom,
+    NOTES: set_notes_and_save,
+    CONFIRM: confirm_request,
+}
 
-    if text == "⛔ Выход":
+
+async def _dispatch_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, label):
+    """Прерывает активный сценарий и открывает раздел с первого нажатия."""
+    flow_before = context.user_data.get("_flow")
+    # Персистентный черновик (conversation_state) при переключении сохраняем:
+    # удаление возможно только явной отменой внутри создания или по /start.
+    _abort_flow(context, preserve_persistent_draft=True)
+    user_id, chat_id = _update_ids(update)
+    _log_op(
+        "menu_dispatch",
+        user_id=user_id,
+        chat_id=chat_id,
+        state_before=flow_before,
+        state_after=None,
+        flow=flow_before,
+        detail=label,
+    )
+
+    handler = None
+    flow = None
+    if label == "➕ Добавить заявку":
+        handler, flow = start_add_request, "create"
+    elif label == "📋 Мои заявки":
+        handler, flow = my_requests_start, "my_search"
+    elif label == "📋 Заявки":
+        # Кнопка остаётся обрабатываемой для старых Telegram-клавиатур.
+        handler = requests_list_start
+    elif label == "✅ Завершить заявку":
+        handler, flow = complete_start, "complete"
+    elif label == "📊 Анализ":
+        handler = analysis_start
+    elif label == "📊 Дашборд":
+        handler = dashboard_start
+    elif label == "⚙️ Настройки":
+        handler = admin_start
+    elif label == "⛔ Выход":
         await _safe_reply(
             update,
             "👋 До встречи! Для возврата введите /start",
             reply_markup=ReplyKeyboardMarkup([["/start"]], resize_keyboard=True),
         )
-    elif text == "📊 Анализ":
-        # Перенаправляем на analysis_start
-        return await analysis_start(update, context)
-    elif text == "📊 Дашборд":
-        # Перенаправляем на dashboard_start
-        return await dashboard_start(update, context)
+        return None
     else:
+        return None
+
+    result = await handler(update, context)
+    _apply_step_result(context, result, update=update, flow=flow)
+    return result
+
+
+async def _dispatch_create_text(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, text: str
+):
+    """Маршрутизация текста внутри сценария создания заявки."""
+    step = context.user_data.get("_step")
+    if step == PHOTO:
+        if text in ("✅ Готово", "➡️ Пропустить"):
+            handler = handle_photo_done
+        else:
+            handler = handle_photo_hint
+    else:
+        handler = _CREATE_TEXT_HANDLERS.get(step)
+    if handler is None:
+        await _safe_reply(
+            update,
+            "Используйте кнопки меню или /start",
+            reply_markup=get_main_keyboard(update.effective_user.id),
+        )
+        return None
+    return await handler(update, context)
+
+
+async def route_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Единый текстовый маршрутизатор (регистрируется первым в группе).
+
+    Порядок: сначала кнопки главного меню — они завершают несовместимый
+    сценарий и открывают раздел с первого нажатия; затем активный сценарий
+    ввода текста; иначе — нейтральная подсказка. Сообщение «Выберите заявку
+    кнопкой из списка» возможно только вне меню, в состоянии выбора.
+    """
+    text = _message_text(update)
+    user_id = update.effective_user.id
+
+    # 1. Кнопки главного меню — всегда первыми.
+    label = _menu_label(text)
+    if label is not None:
+        return await _dispatch_menu(update, context, label)
+
+    # 2. Отмена текущей операции (не затрагивает чужие данные).
+    if _normalize_text(text) == _normalize_text("❌ Отмена"):
+        return await cancel(update, context)
+
+    # 3. Активный сценарий ввода.
+    flow = context.user_data.get("_flow")
+    result = None
+    if flow == "create":
+        result = await _dispatch_create_text(update, context, text)
+    elif flow == "register" and context.user_data.get("_step") == REG_NAME:
+        result = await register_name(update, context)
+    elif flow == "complete":
+        step = context.user_data.get("_step")
+        if step == COMPLETE_COMMENT:
+            result = await complete_comment_text_handler(update, context)
+        elif step == COMPLETE_CONFIRM:
+            await _safe_reply(update, "👆 Подтвердите или отмените кнопкой.")
+        elif step == COMPLETE_SELECT:
+            await _safe_reply(update, "👆 Выберите заявку кнопкой из списка.")
+        else:
+            flow = None
+    elif flow == "my_search":
+        result = await my_requests_search_text_handler(update, context)
+    elif flow == "edit" and context.user_data.get("_step") == EDIT_INPUT_VALUE:
+        result = await edit_input_handler(update, context)
+    elif flow == "admin":
+        step = context.user_data.get("_step")
+        if step == ADMIN_RENAME_NEW:
+            result = await admin_rename_new_handler(update, context)
+        elif step == ADMIN_ADD_VALUE:
+            result = await admin_add_value_handler(update, context)
+        else:
+            flow = None
+    else:
+        flow = None
+
+    if flow is None and result is None:
+        # Нет активного сценария — нейтральная подсказка, меню не блокируется.
         await _safe_reply(
             update,
             "Используйте кнопки меню или /start",
             reply_markup=get_main_keyboard(user_id),
         )
+        return None
+
+    _apply_step_result(context, result, update=update)
+    return None
+
+
+async def route_non_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Маршрутизация не-текстовых сообщений (фото, стикеры, файлы)."""
+    flow = context.user_data.get("_flow")
+    if flow == "create" and context.user_data.get("_step") == PHOTO:
+        if update.message and update.message.photo:
+            result = await handle_photo(update, context)
+        else:
+            result = await handle_photo_hint(update, context)
+        _apply_step_result(context, result, update=update)
+        return
+    if flow is not None:
+        # Ошибка формата в активном сценарии — подсказка, состояние не меняем.
+        await handle_non_text_hint(update, context)
+        return
+    # Вне сценариев не-текст игнорируется (как и раньше).
 
 
 # ===== ДАШБОРД =====
@@ -3194,29 +3633,6 @@ async def dashboard_reqs_callback(update: Update, context: ContextTypes.DEFAULT_
         return
     context.user_data["req_filter"] = None
     await _show_requests_list(update, context, 0)
-
-
-async def dashboard_report_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик кнопки «Отчёт» на дашборде — генерирует отчёт."""
-    query = update.callback_query
-    await _safe_answer(query)
-    if not is_admin(update.effective_user.id):
-        return
-    mode = query.data.split(":")[1]
-    await _safe_edit(query, "⏳ Формирую отчёт...")
-    try:
-        result, ids_with_photos, all_ids, requests_data = build_report(mode=mode)
-        keyboard = _build_photo_keyboard(ids_with_photos, all_ids, requests_data)
-        await send_long_message(
-            context,
-            query.message.chat_id,
-            result,
-            parse_mode="HTML",
-            reply_markup=keyboard,
-        )
-    except Exception as e:
-        logger.error(f"Ошибка формирования отчёта из дашборда: {e}", exc_info=True)
-        await _safe_edit(query, "❌ Ошибка при формировании отчёта.")
 
 
 # ===== РАЗДЕЛ «ЗАЯВКИ» =====
@@ -3496,6 +3912,8 @@ async def requests_card_handler(update: Update, context: ContextTypes.DEFAULT_TY
         if not req:
             await _safe_edit(query, "⚠️ Заявка не найдена.")
             return ConversationHandler.END
+        # Переключение сценария ДО записи ключей (abort чужого сценария).
+        _set_flow_step(context, "edit", EDIT_INPUT_VALUE, update=update, arm=True)
         context.user_data["edit_request"] = req
         context.user_data["edit_fields_order"] = [
             "name",
@@ -3550,6 +3968,8 @@ async def requests_card_handler(update: Update, context: ContextTypes.DEFAULT_TY
         # Выбор поля → запрос нового значения
         await _safe_answer(query)
         field = data.split(":")[1]
+        # Переключение сценария ДО записи ключей (abort чужого сценария).
+        _set_flow_step(context, "edit", EDIT_INPUT_VALUE, update=update, arm=True)
         context.user_data["edit_field"] = field
         field_names = {
             "name": "наименование",
@@ -3973,6 +4393,170 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ===== ГЛАВНАЯ ФУНКЦИЯ =====
+
+
+def register_handlers(app):
+    """Регистрация всех обработчиков PTB в одной группе.
+
+    Порядок критичен: сначала команды, затем главный текстовый
+    роутер (кнопки меню работают из любого состояния с первого
+    нажатия), затем callback-обработчики с якорными паттернами.
+    ConversationHandler не используется.
+    """
+    # ===== Регистрация обработчиков (одна группа) =====
+    # Порядок критичен: команды, затем ГЛАВНЫЙ текстовый роутер (кнопки
+    # меню работают из любого состояния с первого нажатия), затем
+    # не-текстовый роутер и callback-обработчики с якорными паттернами.
+    # ConversationHandler как оркестратор не используется — состояния
+    # живут в user_data (_flow/_step), предупреждений PTBUserWarning
+    # о per_message=False быть не должно.
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("cancel", cancel))
+    app.add_handler(CommandHandler("status", status_start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, route_text))
+    app.add_handler(MessageHandler(~filters.TEXT & ~filters.COMMAND, route_non_text))
+
+    # --- Завершение заявки ---
+    app.add_handler(
+        CallbackQueryHandler(_flow_result(complete_page_handler), pattern=r"^crp:\d+$")
+    )
+    app.add_handler(
+        CallbackQueryHandler(_flow_result(complete_batch_handler), pattern=r"^crb:\d+$")
+    )
+    app.add_handler(
+        CallbackQueryHandler(_flow_result(complete_start), pattern=r"^crnoop$")
+    )
+    app.add_handler(
+        CallbackQueryHandler(_flow_result(complete_select_handler), pattern=r"^cr:\d+$")
+    )
+    app.add_handler(
+        CallbackQueryHandler(
+            _flow_result(complete_comment_handler),
+            pattern=r"^cr:(nocomment|cancel)$",
+        )
+    )
+    app.add_handler(
+        CallbackQueryHandler(
+            _flow_result(complete_confirm_handler),
+            pattern=r"^cr:(confirm|cancel)$",
+        )
+    )
+
+    # --- Смена статуса (/status и карточки) ---
+    app.add_handler(
+        CallbackQueryHandler(_flow_result(status_select_handler), pattern=r"^ss:\d+$")
+    )
+    app.add_handler(
+        CallbackQueryHandler(_flow_result(status_page_handler), pattern=r"^ssp:\d+$")
+    )
+    app.add_handler(
+        CallbackQueryHandler(_flow_result(status_confirm_handler), pattern=r"^ssc:.+$")
+    )
+
+    # --- Мои заявки ---
+    app.add_handler(
+        CallbackQueryHandler(
+            _flow_result(my_requests_page_handler), pattern=r"^mrp:(prev|next)$"
+        )
+    )
+    app.add_handler(
+        CallbackQueryHandler(
+            _flow_result(my_requests_refresh_handler), pattern=r"^mrrefresh$"
+        )
+    )
+    app.add_handler(
+        CallbackQueryHandler(
+            _flow_result(my_requests_search_handler), pattern=r"^mrsearch$"
+        )
+    )
+    app.add_handler(
+        CallbackQueryHandler(_flow_result(my_requests_start), pattern=r"^mrnoop$")
+    )
+
+    # --- Список заявок и карточка ---
+    app.add_handler(
+        CallbackQueryHandler(
+            _flow_result(requests_filter_handler), pattern=r"^reqf:.+$"
+        )
+    )
+    app.add_handler(
+        CallbackQueryHandler(_flow_result(requests_page_handler), pattern=r"^reqp:\d+$")
+    )
+    app.add_handler(
+        CallbackQueryHandler(_flow_result(requests_card_show), pattern=r"^rc:\d+$")
+    )
+    app.add_handler(
+        CallbackQueryHandler(_flow_result(requests_noop_handler), pattern=r"^reqnoop$")
+    )
+    # Навигация редактирования — отдельными паттернами (раньше входила
+    # в составной pattern состояния REQUESTS_CARD).
+    app.add_handler(
+        CallbackQueryHandler(_flow_result(edit_next_handler), pattern=r"^editnext$")
+    )
+    app.add_handler(
+        CallbackQueryHandler(_flow_result(edit_finish_handler), pattern=r"^editfinish$")
+    )
+    app.add_handler(
+        CallbackQueryHandler(_flow_result(edit_prev_handler), pattern=r"^editprev$")
+    )
+    app.add_handler(
+        CallbackQueryHandler(
+            _flow_result(requests_card_handler),
+            pattern=(
+                r"^(reqst|reqssc|reqsscancel|reqe|editf|editcancel"
+                r"|reqdel|reqdelyes|reqdelno|reqback):?.*$"
+            ),
+        )
+    )
+
+    # --- Админ-панель (настройки) ---
+    # back_main/list: обслуживает admin_menu_handler (поведение как в
+    # старом ADMIN_MENU); кнопки списка — admin_list_view_handler.
+    app.add_handler(
+        CallbackQueryHandler(
+            _flow_result(admin_menu_handler),
+            pattern=r"^(buttons|clear_db|backup|audit|back_main|list:.+)$",
+        )
+    )
+    app.add_handler(
+        CallbackQueryHandler(
+            _flow_result(admin_list_view_handler),
+            pattern=r"^(add|rename:\d+|del:\d+|set_bpr)$",
+        )
+    )
+    app.add_handler(
+        CallbackQueryHandler(
+            _flow_result(admin_delete_handler), pattern=r"^confirm_del:\d+$"
+        )
+    )
+    app.add_handler(
+        CallbackQueryHandler(
+            _flow_result(admin_buttons_edit_handler), pattern=r"^bpr:[1-6]$"
+        )
+    )
+    app.add_handler(
+        CallbackQueryHandler(
+            _flow_result(admin_clear_db_execute),
+            pattern=r"^clear_db:(confirm|cancel)$",
+        )
+    )
+
+    # --- Анализ и дашборд ---
+    app.add_handler(
+        CallbackQueryHandler(
+            _flow_result(analysis_filter_handler),
+            pattern=r"^report:(active|completed)$",
+        )
+    )
+    app.add_handler(
+        CallbackQueryHandler(dashboard_reqs_callback, pattern=r"^reqs:all:\d+$")
+    )
+
+    # --- Просмотр фото и карточка заявки (stateless, IDOR) ---
+    app.add_handler(CallbackQueryHandler(show_request_photos, pattern=r"^photos:\d+$"))
+    app.add_handler(CallbackQueryHandler(show_request_details, pattern=r"^detail:\d+$"))
+
+
 def main():
     """Точка входа"""
     from config import _validate_config
@@ -4026,298 +4610,7 @@ def main():
     # Регистрация глобального обработчика ошибок
     app.add_error_handler(error_handler)
 
-    conv_handler = ConversationHandler(
-        entry_points=[
-            MessageHandler(filters.Regex("^➕ Добавить заявку$"), start_add_request)
-        ],
-        states={
-            NAME: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, set_name),
-                MessageHandler(
-                    ~filters.TEXT & ~filters.COMMAND, non_text_hint_for(NAME)
-                ),
-            ],
-            QUANTITY: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, set_quantity),
-                MessageHandler(
-                    ~filters.TEXT & ~filters.COMMAND, non_text_hint_for(QUANTITY)
-                ),
-            ],
-            UNIT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, set_unit),
-                MessageHandler(
-                    ~filters.TEXT & ~filters.COMMAND, non_text_hint_for(UNIT)
-                ),
-            ],
-            INITIATOR: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, set_initiator),
-                MessageHandler(
-                    ~filters.TEXT & ~filters.COMMAND, non_text_hint_for(INITIATOR)
-                ),
-            ],
-            INITIATOR_CUSTOM: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, set_initiator_custom),
-                MessageHandler(
-                    ~filters.TEXT & ~filters.COMMAND,
-                    non_text_hint_for(INITIATOR_CUSTOM),
-                ),
-            ],
-            OBJECT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, set_object),
-                MessageHandler(
-                    ~filters.TEXT & ~filters.COMMAND, non_text_hint_for(OBJECT)
-                ),
-            ],
-            OBJECT_CUSTOM: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, set_object_custom),
-                MessageHandler(
-                    ~filters.TEXT & ~filters.COMMAND, non_text_hint_for(OBJECT_CUSTOM)
-                ),
-            ],
-            NOTES: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, set_notes_and_save),
-                MessageHandler(
-                    ~filters.TEXT & ~filters.COMMAND, non_text_hint_for(NOTES)
-                ),
-            ],
-            PHOTO: [
-                MessageHandler(filters.PHOTO, handle_photo),
-                MessageHandler(filters.Regex("^✅ Готово$"), handle_photo_done),
-                MessageHandler(filters.Regex("^➡️ Пропустить$"), handle_photo_done),
-                MessageHandler(filters.Regex("^❌ Отмена$"), cancel),
-                MessageHandler(filters.ALL & ~filters.COMMAND, handle_photo_hint),
-            ],
-            CONFIRM: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, confirm_request),
-                MessageHandler(
-                    ~filters.TEXT & ~filters.COMMAND, non_text_hint_for(CONFIRM)
-                ),
-            ],
-        },
-        fallbacks=[
-            CommandHandler("cancel", cancel),
-            MessageHandler(filters.Regex("^❌ Отмена$"), cancel),
-        ],
-        per_message=False,
-    )
-
-    admin_handler = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("Настройки"), admin_start)],
-        states={
-            ADMIN_MENU: [CallbackQueryHandler(admin_menu_handler)],
-            ADMIN_LIST_VIEW: [CallbackQueryHandler(admin_list_view_handler)],
-            ADMIN_RENAME_NEW: [
-                MessageHandler(
-                    filters.TEXT & ~filters.COMMAND, admin_rename_new_handler
-                )
-            ],
-            ADMIN_DELETE: [CallbackQueryHandler(admin_delete_handler)],
-            ADMIN_ADD_VALUE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_value_handler)
-            ],
-            ADMIN_BUTTONS_EDIT: [CallbackQueryHandler(admin_buttons_edit_handler)],
-            ADMIN_CLEAR_DB_CONFIRM: [
-                CallbackQueryHandler(
-                    admin_clear_db_execute, pattern=r"^clear_db:(confirm|cancel)$"
-                )
-            ],
-        },
-        fallbacks=[
-            CommandHandler("cancel", admin_cancel),
-            MessageHandler(filters.Regex("^❌ Отмена$"), admin_cancel),
-            MessageHandler(filters.Regex("Настройки"), admin_start),
-        ],
-    )
-
-    analysis_handler = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^📊 Анализ$"), analysis_start)],
-        states={
-            0: [
-                CallbackQueryHandler(
-                    analysis_filter_handler, pattern=r"^report:(active|completed)$"
-                )
-            ],
-        },
-        fallbacks=[
-            CommandHandler("cancel", cancel),
-        ],
-    )
-
-    complete_handler = ConversationHandler(
-        entry_points=[
-            MessageHandler(filters.Regex("^✅ Завершить заявку$"), complete_start)
-        ],
-        states={
-            COMPLETE_SELECT: [
-                CallbackQueryHandler(complete_select_handler, pattern=r"^cr:\d+$"),
-                CallbackQueryHandler(complete_page_handler, pattern=r"^crp:\d+$"),
-                CallbackQueryHandler(complete_batch_handler, pattern=r"^crb:\d+$"),
-                CallbackQueryHandler(complete_start, pattern=r"^crnoop$"),
-                MessageHandler(
-                    filters.TEXT & ~filters.COMMAND, complete_select_text_hint
-                ),
-                MessageHandler(
-                    ~filters.TEXT & ~filters.COMMAND,
-                    non_text_hint_for(COMPLETE_SELECT),
-                ),
-            ],
-            COMPLETE_COMMENT: [
-                CallbackQueryHandler(
-                    complete_comment_handler, pattern=r"^cr:(nocomment|cancel)$"
-                ),
-                MessageHandler(
-                    filters.TEXT & ~filters.COMMAND, complete_comment_text_handler
-                ),
-                MessageHandler(
-                    ~filters.TEXT & ~filters.COMMAND,
-                    non_text_hint_for(COMPLETE_COMMENT),
-                ),
-            ],
-            COMPLETE_CONFIRM: [
-                CallbackQueryHandler(
-                    complete_confirm_handler, pattern=r"^cr:(confirm|cancel)$"
-                ),
-                MessageHandler(
-                    filters.TEXT & ~filters.COMMAND, complete_confirm_text_hint
-                ),
-                MessageHandler(
-                    ~filters.TEXT & ~filters.COMMAND,
-                    non_text_hint_for(COMPLETE_CONFIRM),
-                ),
-            ],
-        },
-        fallbacks=[
-            CommandHandler("cancel", cancel),
-            MessageHandler(filters.Regex("^❌ Отмена$"), cancel),
-        ],
-        per_message=False,
-    )
-
-    status_handler = ConversationHandler(
-        entry_points=[
-            CommandHandler("status", status_start),
-        ],
-        states={
-            STATUS_SELECT: [
-                CallbackQueryHandler(status_select_handler, pattern=r"^ss:\d+$"),
-                CallbackQueryHandler(status_page_handler, pattern=r"^ssp:\d+$"),
-            ],
-            STATUS_CONFIRM: [
-                CallbackQueryHandler(status_confirm_handler, pattern=r"^ssc:.+$"),
-            ],
-        },
-        fallbacks=[
-            CommandHandler("cancel", cancel),
-            MessageHandler(filters.Regex("^❌ Отмена$"), cancel),
-        ],
-    )
-
-    my_requests_handler = ConversationHandler(
-        entry_points=[
-            MessageHandler(filters.Regex("^📋 Мои заявки$"), my_requests_start)
-        ],
-        states={
-            MY_REQUESTS_SELECT: [
-                CallbackQueryHandler(
-                    my_requests_page_handler, pattern=r"^mrp:(prev|next)$"
-                ),
-                CallbackQueryHandler(
-                    my_requests_refresh_handler, pattern=r"^mrrefresh$"
-                ),
-                CallbackQueryHandler(my_requests_search_handler, pattern=r"^mrsearch$"),
-                CallbackQueryHandler(my_requests_start, pattern=r"^mrnoop$"),
-                MessageHandler(
-                    filters.TEXT & ~filters.COMMAND, my_requests_search_text_handler
-                ),
-            ],
-        },
-        fallbacks=[
-            CommandHandler("cancel", cancel),
-            MessageHandler(filters.Regex("^❌ Отмена$"), cancel),
-        ],
-    )
-
-    requests_handler = ConversationHandler(
-        entry_points=[
-            MessageHandler(filters.Regex("^📋 Заявки$"), requests_list_start)
-        ],
-        states={
-            REQUESTS_LIST: [
-                CallbackQueryHandler(requests_filter_handler, pattern=r"^reqf:.+$"),
-                CallbackQueryHandler(requests_page_handler, pattern=r"^reqp:\d+$"),
-                CallbackQueryHandler(requests_card_show, pattern=r"^rc:\d+$"),
-                CallbackQueryHandler(requests_noop_handler, pattern=r"^reqnoop$"),
-            ],
-            REQUESTS_CARD: [
-                CallbackQueryHandler(
-                    requests_card_handler,
-                    pattern=r"^(reqst|reqssc|reqsscancel|reqe|editf|editcancel|editnext|editfinish|reqdel|reqdelyes|reqdelno|reqback):?.*$",
-                ),
-            ],
-            EDIT_INPUT_VALUE: [
-                CallbackQueryHandler(
-                    edit_next_handler,
-                    pattern=r"^editnext$",
-                ),
-                CallbackQueryHandler(
-                    edit_finish_handler,
-                    pattern=r"^editfinish$",
-                ),
-                CallbackQueryHandler(
-                    edit_prev_handler,
-                    pattern=r"^editprev$",
-                ),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_input_handler),
-            ],
-        },
-        fallbacks=[
-            CommandHandler("cancel", cancel),
-            MessageHandler(filters.Regex("^❌ Отмена$"), cancel),
-        ],
-    )
-
-    register_conv = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
-        states={
-            REG_NAME: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, register_name),
-                MessageHandler(
-                    ~filters.TEXT & ~filters.COMMAND, non_text_hint_for(REG_NAME)
-                ),
-            ],
-        },
-        fallbacks=[
-            CommandHandler("cancel", cancel),
-        ],
-        per_message=False,
-    )
-
-    app.add_handler(register_conv)
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(requests_handler)
-    app.add_handler(analysis_handler)
-    app.add_handler(complete_handler)
-    app.add_handler(status_handler)
-    app.add_handler(my_requests_handler)
-    app.add_handler(admin_handler)
-    app.add_handler(conv_handler)
-    app.add_handler(CallbackQueryHandler(show_request_photos, pattern=r"^photos:\d+$"))
-    app.add_handler(CallbackQueryHandler(show_request_details, pattern=r"^detail:\d+$"))
-    app.add_handler(
-        CallbackQueryHandler(dashboard_reqs_callback, pattern=r"^reqs:all:\d+$")
-    )
-    app.add_handler(
-        CallbackQueryHandler(
-            dashboard_report_callback, pattern=r"^report:(active|completed)$"
-        )
-    )
-    app.add_handler(MessageHandler(filters.Regex("^📊 Дашборд$"), dashboard_start))
-    # Страховка: если ConversationHandler потерял state, а заявка выбрана —
-    # всё равно принимаем комментарий (иначе текст уходит в handle_menu).
-    app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, complete_text_router)
-    )
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu))
+    register_handlers(app)
 
     tz = ZoneInfo(REPORT_TIMEZONE) if REPORT_TIMEZONE else None
 

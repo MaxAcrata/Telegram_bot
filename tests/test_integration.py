@@ -222,8 +222,8 @@ async def test_create_request_with_photos(
 @pytest.mark.asyncio
 @patch("bot.clear_conversation_state")
 async def test_cancel_at_name_step(mock_clear):
-    """Отмена на шаге ввода имени."""
-    ctx = make_context({"name": "Незавершённый"})
+    """Отмена на шаге ввода имени (активный сценарий создания)."""
+    ctx = make_context({"name": "Незавершённый", "_flow": "create", "_step": 0})
     u = make_update(text="❌ Отмена", user_id=777)
 
     result = await cancel(u, ctx)
