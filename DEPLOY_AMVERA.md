@@ -91,4 +91,3 @@ python bot.py
 ## Ссылки
 
 - Репозиторий: https://github.com/MaxAcrata/Telegram_bot
-- Анализ проекта: [ANALYSIS.md](ANALYSIS.md)
