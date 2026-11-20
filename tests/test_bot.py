@@ -430,3 +430,183 @@ async def test_scheduled_report_error_clears_flag(mock_build, mock_send):
     await scheduled_report(context)
 
     assert context.bot_data["_report_running_-100999"] is False
+
+
+# ===== B4: отмена заявки из карточки =====
+
+
+def make_callback_update(data, user_id=123):
+    update = MagicMock()
+    update.callback_query.data = data
+    update.callback_query.answer = AsyncMock()
+    update.callback_query.edit_message_text = AsyncMock()
+    update.callback_query.from_user.id = user_id
+    update.callback_query.message.chat_id = 42
+    update.effective_user.id = user_id
+    update.effective_user.first_name = "Тест"
+    return update
+
+
+def _active_row(req_id=5, status="new", done_date=None):
+    return {
+        "id": req_id,
+        "name": "Цемент",
+        "quantity": 10,
+        "unit": "меш",
+        "initiator": "Иван",
+        "object": "Склад",
+        "status": status,
+        "done_date": done_date,
+        "request_date": "2026-01-01",
+        "notes": "",
+    }
+
+
+def _markup_datas(send_mock):
+    datas = []
+    for call in send_mock.call_args_list:
+        markup = call.kwargs.get("reply_markup")
+        if markup is None:
+            continue
+        for row in markup.inline_keyboard:
+            for btn in row:
+                datas.append(btn.callback_data)
+    return datas
+
+
+@pytest.mark.asyncio
+@patch("bot.get_request_photos", return_value=[])
+@patch("bot.get_request_by_id")
+@patch("bot.ADMIN_IDS", [123])
+async def test_admin_card_shows_cancel_button_for_active(mock_get, mock_photos):
+    """Кнопка «🚫 Отменить» есть у админа для активной заявки."""
+    from bot import show_request_details
+
+    mock_get.return_value = _active_row()
+    update = make_callback_update("detail:5", user_id=123)
+    context = make_context()
+
+    await show_request_details(update, context)
+
+    assert "reqcx:5" in _markup_datas(context.bot.send_message)
+
+
+@pytest.mark.asyncio
+@patch("bot.is_request_owner", return_value=True)
+@patch("bot.get_request_photos", return_value=[])
+@patch("bot.get_request_by_id")
+@patch("bot.ADMIN_IDS", [123])
+async def test_user_card_hides_cancel_button(mock_get, mock_photos, mock_owner):
+    """Обычный пользователь (владелец) не видит административной кнопки."""
+    from bot import show_request_details
+
+    mock_get.return_value = _active_row()
+    update = make_callback_update("detail:5", user_id=777)
+    context = make_context()
+
+    await show_request_details(update, context)
+
+    assert "reqcx:5" not in _markup_datas(context.bot.send_message)
+
+
+@pytest.mark.asyncio
+@patch("bot.get_request_photos", return_value=[])
+@patch("bot.get_request_by_id")
+@patch("bot.ADMIN_IDS", [123])
+async def test_done_request_card_hides_cancel_button(mock_get, mock_photos):
+    """Для выполненной заявки кнопка отмены не показывается."""
+    from bot import show_request_details
+
+    mock_get.return_value = _active_row(status="done", done_date="2026-01-05")
+    update = make_callback_update("detail:5", user_id=123)
+    context = make_context()
+
+    await show_request_details(update, context)
+
+    assert "reqcx:5" not in _markup_datas(context.bot.send_message)
+
+
+@pytest.mark.asyncio
+@patch("bot.get_initiator_tg_id", return_value=777)
+@patch("bot.cancel_request")
+@patch("bot.get_request_by_id")
+@patch("bot.ADMIN_IDS", [123])
+async def test_cancel_flow_with_comment_notifies_initiator(
+    mock_get, mock_cancel, mock_tg
+):
+    """Полный флоу отмены: карточка -> комментарий -> подтверждение."""
+    from bot import (
+        CANCEL_COMMENT,
+        CANCEL_CONFIRM,
+        cancel_confirm_handler,
+        cancel_flow_start,
+        route_text,
+    )
+
+    mock_get.return_value = _active_row()
+    mock_cancel.return_value = (_active_row(status="cancelled"), True)
+
+    context = make_context()
+
+    # 1) Вход в флоу по кнопке из карточки
+    result = await cancel_flow_start(make_callback_update("reqcx:5"), context)
+    assert result == CANCEL_COMMENT
+    assert context.user_data["_flow"] == "cancel_request"
+    assert context.user_data["_step"] == CANCEL_COMMENT
+    assert context.user_data["cancel_request"]["id"] == 5
+
+    # 2) Комментарий текстом через единый роутер
+    await route_text(make_update(text="Неактуально"), context)
+    assert context.user_data["_step"] == CANCEL_CONFIRM
+    assert context.user_data["cancel_comment"] == "Неактуально"
+
+    # 3) Подтверждение
+    await cancel_confirm_handler(make_callback_update("reqcxyes:5"), context)
+
+    mock_cancel.assert_called_once()
+    assert mock_cancel.call_args.kwargs["comment"] == "Неактуально"
+    # Состояние завершено
+    assert "_flow" not in context.user_data
+    assert "cancel_request" not in context.user_data
+    # Уведомление инициатору (tg_id=777)
+    assert any(
+        call.kwargs.get("chat_id") == 777
+        for call in context.bot.send_message.call_args_list
+    )
+
+
+@pytest.mark.asyncio
+@patch("bot.get_initiator_tg_id", return_value=777)
+@patch("bot.cancel_request")
+@patch("bot.get_request_by_id")
+@patch("bot.ADMIN_IDS", [123])
+async def test_cancel_repeat_is_idempotent_in_ui(mock_get, mock_cancel, mock_tg):
+    """Повторное подтверждение: «уже отменена», без второго уведомления."""
+    from bot import (
+        CANCEL_COMMENT,
+        CANCEL_CONFIRM,
+        cancel_confirm_handler,
+        cancel_flow_start,
+        route_text,
+    )
+
+    mock_get.return_value = _active_row()
+    # Второй вызов: строка уже cancelled, changed=False
+    mock_cancel.return_value = (_active_row(status="cancelled"), False)
+
+    context = make_context()
+    await cancel_flow_start(make_callback_update("reqcx:5"), context)
+    await route_text(make_update(text="Комментарий"), context)
+    confirm = make_callback_update("reqcxyes:5")
+    await cancel_confirm_handler(confirm, context)
+
+    # Идемпотентно: повторно НЕ уведомляем инициатора
+    assert not any(
+        call.kwargs.get("chat_id") == 777
+        for call in context.bot.send_message.call_args_list
+    )
+    edits = [
+        str(call.args[0])
+        for call in confirm.callback_query.edit_message_text.call_args_list
+    ]
+    assert any("уже была отменена" in e for e in edits)

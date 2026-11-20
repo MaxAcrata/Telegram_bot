@@ -74,6 +74,7 @@ from db import (
     get_active_requests,
     complete_request,
     complete_requests_batch,
+    cancel_request,
     link_initiator,
     get_initiator_tg_id,
     get_initiator_by_tg_id,
@@ -181,6 +182,9 @@ EDIT_SELECT_FIELD, EDIT_INPUT_VALUE = 140, 141
 # ===== СОСТОЯНИЯ УДАЛЕНИЯ ЗАЯВКИ =====
 DELETE_CONFIRM = 145
 
+# ===== СОСТОЯНИЯ ОТМЕНЫ ЗАЯВКИ (админ, флоу «🚫 Отменить») =====
+CANCEL_COMMENT, CANCEL_CONFIRM = 146, 147
+
 # ===== ИНФРАСТРУКТУРА ЕДИНОГО ТЕКСТОВОГО РОУТЕРА =====
 # Сценарии хранятся в user_data как _flow/_step; ConversationHandler
 # как оркестратор не используется (END остаётся лишь константой-сентинелом).
@@ -224,6 +228,8 @@ _FLOW_TEMP_KEYS = frozenset(
         "admin_delete_value",
         "req_filter",
         "cd_page",
+        "cancel_request",
+        "cancel_comment",
         "_flow",
         "_step",
         "_flow_token",
@@ -247,6 +253,7 @@ _FLOW_STEPS = {
     },
     "register": {REG_NAME},
     "complete": {COMPLETE_SELECT, COMPLETE_COMMENT, COMPLETE_CONFIRM},
+    "cancel_request": {CANCEL_COMMENT, CANCEL_CONFIRM},
     "my_search": {MY_REQUESTS_SELECT},
     "edit": {EDIT_INPUT_VALUE},
     "admin": {
@@ -276,6 +283,7 @@ _TEXT_FLOW_STEPS = {
     },
     "register": {REG_NAME},
     "complete": {COMPLETE_COMMENT},
+    "cancel_request": {CANCEL_COMMENT},  # текст комментария отмены
     "my_search": set(),  # поиск включается кнопкой mrsearch — там и ставится таймер
     "edit": {EDIT_INPUT_VALUE},
     "admin": {ADMIN_RENAME_NEW, ADMIN_ADD_VALUE},
@@ -1052,17 +1060,21 @@ async def show_request_details(update: Update, context: ContextTypes.DEFAULT_TYP
     if photo_text:
         text += photo_text
 
-    keyboard = None
+    keyboard_rows = []
     if photos:
-        keyboard = InlineKeyboardMarkup(
+        keyboard_rows.append(
             [
-                [
-                    InlineKeyboardButton(
-                        f"📎 Фото ({len(photos)})", callback_data=f"photos:{req_id}"
-                    )
-                ]
+                InlineKeyboardButton(
+                    f"📎 Фото ({len(photos)})", callback_data=f"photos:{req_id}"
+                )
             ]
         )
+    # Административное действие — только для админа и только активной заявки
+    if is_admin(user_id) and _is_active_request(req):
+        keyboard_rows.append(
+            [InlineKeyboardButton("🚫 Отменить", callback_data=f"reqcx:{req_id}")]
+        )
+    keyboard = InlineKeyboardMarkup(keyboard_rows) if keyboard_rows else None
 
     await _safe_send(
         context,
@@ -1262,7 +1274,10 @@ async def scheduled_report(context: ContextTypes.DEFAULT_TYPE):
     _log_op("scheduled_report:started", chat_id=chat_id)
 
     try:
-        result, ids_with_photos, all_ids, requests_data = build_report()
+        # build_report — длительные запросы: не блокируем event loop.
+        result, ids_with_photos, all_ids, requests_data = await asyncio.to_thread(
+            build_report
+        )
         keyboard = _build_photo_keyboard(ids_with_photos, all_ids, requests_data)
         await send_long_message(
             context, chat_id, result, parse_mode="HTML", reply_markup=keyboard
@@ -1297,7 +1312,7 @@ async def archive_old_requests_job(context: ContextTypes.DEFAULT_TYPE):
     started = _monotonic()
     _log_op("archive_old_requests:started")
     try:
-        count = archive_completed_requests()
+        count = await asyncio.to_thread(archive_completed_requests)
     except Exception as e:
         _log_op(
             "archive_old_requests:failed",
@@ -2162,7 +2177,10 @@ async def analysis_filter_handler(update: Update, context: ContextTypes.DEFAULT_
     await _safe_edit(query, "⏳ Формирую отчёт...")
 
     try:
-        result, ids_with_photos, all_ids, requests_data = build_report(mode=mode)
+        # Не блокируем event loop: отчёт — длительные запросы к БД.
+        result, ids_with_photos, all_ids, requests_data = await asyncio.to_thread(
+            build_report, mode=mode
+        )
         keyboard = _build_photo_keyboard(ids_with_photos, all_ids, requests_data)
         await send_long_message(
             context,
@@ -2581,6 +2599,202 @@ async def complete_confirm_handler(update: Update, context: ContextTypes.DEFAULT
     return ConversationHandler.END
 
 
+# ===== ОТМЕНА ЗАЯВКИ (админ, из карточки) =====
+_ACTIVE_STATUSES = ("new", "ordered", "delivered")
+
+
+def _is_active_request(req) -> bool:
+    """Активная заявка: допустимы завершение и отмена."""
+    return (
+        bool(req) and req.get("status") in _ACTIVE_STATUSES and not req.get("done_date")
+    )
+
+
+async def cancel_flow_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """reqcx:{id} — вход в флоу отмены из административной карточки."""
+    query = update.callback_query
+    await _safe_answer(query)
+    if not is_admin(update.effective_user.id):
+        await _safe_edit(query, "⛔ Нет доступа.")
+        return None
+    req_id = int(query.data.split(":", 1)[1])
+    req = get_request_by_id(req_id)
+    if not req:
+        await _safe_edit(query, "⚠️ Заявка не найдена.")
+        return None
+    if not _is_active_request(req):
+        await _safe_edit(
+            query,
+            "⛔ Отменить можно только активную заявку "
+            f"(сейчас: {STATUS_LABELS.get(req.get('status'), req.get('status'))}).",
+        )
+        return None
+    # Переключение сценария ДО записи ключей (abort чужого сценария).
+    _set_flow_step(context, "cancel_request", CANCEL_COMMENT, update=update, arm=True)
+    context.user_data["cancel_request"] = req
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "➡️ Без комментария", callback_data=f"reqcxnc:{req_id}"
+            ),
+            InlineKeyboardButton("❌ Назад", callback_data="reqcxback"),
+        ],
+    ]
+    await _safe_edit(
+        query,
+        f"🚫 <b>Отменить заявку #{req['id']}?</b>\n\n"
+        f"📦 {escape(req.get('name', '—'))}\n"
+        f"👤 {escape(req.get('initiator', '—'))}\n"
+        f"🏗️ Объект: {escape(req.get('object', '—'))}\n\n"
+        "Введите необязательный комментарий сообщением\n"
+        "или нажмите «➡️ Без комментария»:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="HTML",
+    )
+    return CANCEL_COMMENT
+
+
+async def _show_cancel_confirm(update, context, *, via_edit: bool):
+    """Финальное подтверждение отмены (CANCEL_CONFIRM — inline-шаг, без таймера)."""
+    req = context.user_data.get("cancel_request") or {}
+    comment = context.user_data.get("cancel_comment", "")
+    text = (
+        f"🚫 <b>Отменить заявку #{req.get('id', '?')}?</b>\n\n"
+        f"📦 {escape(req.get('name', '—'))}\n"
+        f"👤 {escape(req.get('initiator', '—'))}\n"
+        f"🏗️ Объект: {escape(req.get('object', '—'))}"
+    )
+    if comment:
+        text += f"\n💬 Комментарий: {escape(comment)}"
+    text += "\n\nОтменить заявку?"
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "✅ Да, отменить", callback_data=f"reqcxyes:{req.get('id', '')}"
+                ),
+                InlineKeyboardButton("❌ Нет", callback_data="reqcxno"),
+            ]
+        ]
+    )
+    _set_flow_step(context, "cancel_request", CANCEL_CONFIRM)
+    if via_edit:
+        await _safe_edit(
+            update.callback_query, text, reply_markup=keyboard, parse_mode="HTML"
+        )
+    else:
+        await _safe_reply(update, text, reply_markup=keyboard, parse_mode="HTML")
+    return CANCEL_CONFIRM
+
+
+async def cancel_comment_text_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    """Принимает необязательный комментарий отмены (через route_text)."""
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    text = _message_text(update)
+    if not is_meaningful_text(text, min_len=1):
+        await _safe_reply(
+            update,
+            "⚠️ Комментарий должен содержать хотя бы одну букву или цифру,\n"
+            "или нажмите «➡️ Без комментария».",
+        )
+        return CANCEL_COMMENT
+    context.user_data["cancel_comment"] = truncate_field(text, MAX_FIELD_LENGTH)
+    return await _show_cancel_confirm(update, context, via_edit=False)
+
+
+async def cancel_nc_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """reqcxnc:{id} — отмена без комментария."""
+    query = update.callback_query
+    await _safe_answer(query)
+    if not is_admin(update.effective_user.id):
+        return None
+    if not context.user_data.get("cancel_request"):
+        await _safe_edit(query, "⏳ Данные устарели. Откройте карточку заново.")
+        _end_flow(context)
+        return None
+    context.user_data["cancel_comment"] = ""
+    return await _show_cancel_confirm(update, context, via_edit=True)
+
+
+async def cancel_back_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """reqcxback / reqcxno — выход из флоу отмены без действия."""
+    query = update.callback_query
+    await _safe_answer(query)
+    context.user_data.pop("cancel_request", None)
+    context.user_data.pop("cancel_comment", None)
+    _end_flow(context)
+    req = context.user_data.get("card_request")
+    if req:
+        return await _render_request_card(query, context, req)
+    await _safe_edit(query, "↩️ Возврат без отмены.")
+    return None
+
+
+async def cancel_confirm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """reqcxyes:{id} — атомарная отмена + уведомление инициатору."""
+    query = update.callback_query
+    await _safe_answer(query)
+    if not is_admin(update.effective_user.id):
+        return None
+    req_id = int(query.data.split(":", 1)[1])
+    req = context.user_data.get("cancel_request")
+    if not req or req.get("id") != req_id:
+        await _safe_edit(query, "⏳ Данные устарели. Откройте карточку заново.")
+        _end_flow(context)
+        return None
+    comment = context.user_data.get("cancel_comment", "")
+
+    row, changed = cancel_request(
+        req_id,
+        user_id=update.effective_user.id,
+        user_name=_user_name(update),
+        comment=comment,
+    )
+
+    context.user_data.pop("cancel_request", None)
+    context.user_data.pop("cancel_comment", None)
+    _end_flow(context)
+
+    if row is None:
+        await _safe_edit(query, "⚠️ Заявка не найдена.")
+        return None
+    if row.get("status") != "cancelled":
+        status_label = STATUS_LABELS.get(row.get("status"), row.get("status"))
+        await _safe_edit(query, f"⛔ Нельзя отменить — статус: {status_label}.")
+        return None
+    if not changed:
+        # Идемпотентность: повторная отмена без второго audit и уведомлений.
+        await _safe_edit(query, "ℹ️ Заявка уже была отменена.")
+        return None
+
+    success_text = f"🚫 Заявка #{req_id} отменена."
+    if comment:
+        success_text += f"\n💬 Комментарий: {escape(comment)}"
+    await _safe_edit(query, success_text, parse_mode="HTML")
+
+    # Уведомление привязанному инициатору (комментарий включается).
+    initiator = row.get("initiator") or ""
+    if initiator:
+        tg_id = get_initiator_tg_id(initiator)
+        if tg_id:
+            notify = f"🚫 <b>Заявка #{req_id} отменена</b>\n\n"
+            notify += f"📦 {escape(row.get('name', '—'))}\n"
+            notify += f"🏗️ {escape(row.get('object', '—'))}"
+            if comment:
+                notify += f"\n💬 Комментарий: {escape(comment)}"
+            await _safe_send(
+                context,
+                tg_id,
+                notify,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+    return None
+
+
 # ===== СМЕНА СТАТУСА ЗАЯВКИ =====
 async def status_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Начинает диалог смены статуса заявки (для админов)"""
@@ -2666,8 +2880,8 @@ async def status_select_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
     keyboard = []
     for st_key, st_label in STATUS_LABELS.items():
-        if st_key == "done":
-            continue  # done handled via complete flow
+        if st_key in ("done", "cancelled"):
+            continue  # done — через завершение; cancelled — только через cancel_request
         if st_key == current:
             continue
         keyboard.append([InlineKeyboardButton(st_label, callback_data=f"ssc:{st_key}")])
@@ -2994,9 +3208,9 @@ async def admin_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await _safe_answer(query)
 
-    path = backup_db()
+    path = await asyncio.to_thread(backup_db)
     if path:
-        ok = verify_backup(path)
+        ok = await asyncio.to_thread(verify_backup, path)
         status = "✅ Проверена" if ok else "⚠️ Проверка не пройдена"
         await _safe_edit(
             query,
@@ -3407,7 +3621,8 @@ async def admin_clear_db_execute(update: Update, context: ContextTypes.DEFAULT_T
         return await _show_main_settings(query)
 
     try:
-        count = clear_all_requests()
+        # Очистка включает backup+verify — выполняется в рабочем потоке целиком.
+        count = await asyncio.to_thread(clear_all_requests)
         await _safe_edit(
             query,
             f"✅ База данных очищена.\nУдалено заявок: <b>{count}</b>\n"
@@ -3561,6 +3776,14 @@ async def route_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _safe_reply(update, "👆 Выберите заявку кнопкой из списка.")
         else:
             flow = None
+    elif flow == "cancel_request":
+        step = context.user_data.get("_step")
+        if step == CANCEL_COMMENT:
+            result = await cancel_comment_text_handler(update, context)
+        elif step == CANCEL_CONFIRM:
+            await _safe_reply(update, "👆 Подтвердите отмену или нажмите «❌ Назад».")
+        else:
+            flow = None
     elif flow == "my_search":
         result = await my_requests_search_text_handler(update, context)
     elif flow == "edit" and context.user_data.get("_step") == EDIT_INPUT_VALUE:
@@ -3612,7 +3835,7 @@ async def dashboard_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await _safe_reply(update, "⛔ У вас нет прав для этой команды.")
         return ConversationHandler.END
-    text = build_dashboard()
+    text = await asyncio.to_thread(build_dashboard)
     keyboard = InlineKeyboardMarkup(
         [
             [
@@ -3680,7 +3903,13 @@ async def _show_requests_list(update_or_query, context, page: int):
                 "🟢 Сделано" if status_filter == "done" else "🟢",
                 callback_data="reqf:done",
             ),
-        ]
+        ],
+        [
+            InlineKeyboardButton(
+                "✅ Отменённые" if status_filter == "cancelled" else "🚫 Отменённые",
+                callback_data="reqf:cancelled",
+            ),
+        ],
     ]
 
     # Список заявок
@@ -3735,6 +3964,7 @@ def _status_emoji(status: str) -> str:
         "ordered": "🟡",
         "delivered": "🔵",
         "done": "🟢",
+        "cancelled": "🚫",
         "archived": "📦",
     }.get(status, "⚪")
 
@@ -3808,11 +4038,16 @@ async def _render_request_card(query, context, req: dict):
             ),
         ]
     )
-    buttons.append(
-        [
-            InlineKeyboardButton("🗑 Удалить", callback_data=f"reqdel:{req_id}"),
-        ]
+    action_row = []
+    card_user = getattr(getattr(query, "from_user", None), "id", None)
+    if is_admin(card_user) and _is_active_request(req):
+        action_row.append(
+            InlineKeyboardButton("🚫 Отменить", callback_data=f"reqcx:{req_id}")
+        )
+    action_row.append(
+        InlineKeyboardButton("🗑 Удалить", callback_data=f"reqdel:{req_id}")
     )
+    buttons.append(action_row)
     buttons.append(
         [
             InlineKeyboardButton("⬅️ Назад к списку", callback_data="reqback"),
@@ -3843,12 +4078,17 @@ async def requests_card_handler(update: Update, context: ContextTypes.DEFAULT_TY
         if not req:
             await _safe_edit(query, "⚠️ Заявка не найдена.")
             return ConversationHandler.END
+        if req.get("status") in ("cancelled", "archived"):
+            # Переходы из cancelled/archived через generic-UI не предлагаются.
+            status_label = STATUS_LABELS.get(req.get("status"), req.get("status"))
+            await _safe_edit(query, f"⛔ Смена статуса недоступна: {status_label}.")
+            return REQUESTS_CARD
         context.user_data["status_request"] = req
         current = req.get("status", "new")
         current_label = STATUS_LABELS.get(current, current)
         keyboard = []
         for st_key, st_label in STATUS_LABELS.items():
-            if st_key == "done" or st_key == "archived":
+            if st_key in ("done", "archived", "cancelled"):
                 continue
             if st_key == current:
                 continue
@@ -4440,6 +4680,25 @@ def register_handlers(app):
             _flow_result(complete_confirm_handler),
             pattern=r"^cr:(confirm|cancel)$",
         )
+    )
+
+    # --- Отмена заявки (админ, из карточки) ---
+    app.add_handler(
+        CallbackQueryHandler(_flow_result(cancel_flow_start), pattern=r"^reqcx:\d+$")
+    )
+    app.add_handler(
+        CallbackQueryHandler(_flow_result(cancel_nc_handler), pattern=r"^reqcxnc:\d+$")
+    )
+    app.add_handler(
+        CallbackQueryHandler(_flow_result(cancel_back_handler), pattern=r"^reqcxback$")
+    )
+    app.add_handler(
+        CallbackQueryHandler(
+            _flow_result(cancel_confirm_handler), pattern=r"^reqcxyes:\d+$"
+        )
+    )
+    app.add_handler(
+        CallbackQueryHandler(_flow_result(cancel_back_handler), pattern=r"^reqcxno$")
     )
 
     # --- Смена статуса (/status и карточки) ---

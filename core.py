@@ -36,12 +36,13 @@ def _trim_url_punctuation(url: str) -> str:
     return url
 
 
-# Эмодзи для статусов
+# Эмодзи для статусов (текстовые метки — в STATUS_LABELS без эмодзи)
 _STATUS_EMOJI = {
     "new": "⚪",
     "ordered": "🟡",
     "delivered": "🔵",
     "done": "🟢",
+    "cancelled": "🚫",
 }
 
 
@@ -107,7 +108,7 @@ def format_task_html(task: dict, today: date, photo_count: int = 0) -> str:
     status_emoji = _STATUS_EMOJI.get(task_status, "⚪")
     status_label = STATUS_LABELS.get(task_status, task_status)
 
-    if is_overdue and task_status not in ("done", "delivered"):
+    if is_overdue and task_status not in ("done", "delivered", "cancelled"):
         status_emoji = "🔴"
 
     qty_text = f"{qty} {unit}".strip() if qty else "—"
@@ -130,7 +131,7 @@ def format_task_html(task: dict, today: date, photo_count: int = 0) -> str:
     if photo_count:
         lines.append(f"   └ 📎 Фото: {photo_count} шт.")
 
-    if is_overdue and task_status not in ("done", "delivered"):
+    if is_overdue and task_status not in ("done", "delivered", "cancelled"):
         overdue_days = days_elapsed - OVERDUE_DAYS
         lines.append(
             f"   └ ⚠️ Просрочено на {overdue_days} дн. (возраст: {days_elapsed} дн.)"
@@ -252,6 +253,7 @@ def _build_active_report(today: date, save_to_file: bool) -> tuple:
         if req_date < today - timedelta(days=OVERDUE_DAYS) and t.get("status") not in (
             "done",
             "delivered",
+            "cancelled",
         ):
             overdue.append(t)
 

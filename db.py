@@ -1,10 +1,11 @@
 import logging
+import os
 import shutil
 import sqlite3
 import uuid
 from datetime import datetime, date
 from pathlib import Path
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 from contextlib import contextmanager
 
 from config import DB_PATH, BACKUP_DIR
@@ -101,23 +102,36 @@ _DEFAULT_LISTS = {
 }
 
 # Допустимые статусы заявок
-VALID_STATUSES = ("new", "ordered", "delivered", "done", "archived")
+VALID_STATUSES = (
+    "new",
+    "ordered",
+    "delivered",
+    "done",
+    "cancelled",
+    "archived",
+)
 STATUS_LABELS = {
     "new": "Новая",
     "ordered": "Заказана",
     "delivered": "Доставлена",
     "done": "Выполнена",
+    "cancelled": "Отменена",
     "archived": "Архив",
 }
 
 
 @contextmanager
 def get_conn():
-    """Контекстный менеджер для соединения с БД."""
+    """Контекстный менеджер для соединения с БД.
+
+    foreign_keys и busy_timeout выставляются на каждом соединении;
+    journal_mode=WAL — постоянный режим файла, выставляется в init_db
+    (без лишней записи при каждом коротком чтении).
+    """
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=5000")
     try:
         yield conn
         conn.commit()
@@ -146,15 +160,74 @@ def _column_exists(conn, table_name: str, column_name: str) -> bool:
         return False
 
 
-def init_db():
-    """Инициализирует БД: создаёт таблицы, мигрирует схему, заполняет пустые справочники."""
-    with get_conn() as conn:
-        conn.executescript(_SCHEMA)
+def _needs_status_migration() -> bool:
+    """Определяет, существует ли БД, требующая миграцию (нет колонки status).
 
-        # Миграция: добавляем status если нет
+    Диагностика выполняется отдельным соединением, которое закрывается
+    до создания резервной копии (см. порядок в init_db).
+    """
+    if not os.path.isfile(DB_PATH):
+        return False
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        try:
+            table = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='requests'"
+            ).fetchone()
+            if table is None:
+                return False
+            return not _column_exists(conn, "requests", "status")
+        finally:
+            conn.close()
+    except sqlite3.Error as e:
+        logger.warning(f"Диагностика миграции пропущена: {e}")
+        return False
+
+
+def _ensure_status_column(conn) -> None:
+    """Идемпотентно добавляет колонку status (если таблица уже существует)."""
+    if _table_exists(conn, "requests") and not _column_exists(
+        conn, "requests", "status"
+    ):
+        conn.execute("ALTER TABLE requests ADD COLUMN status TEXT DEFAULT 'new'")
+        logger.info("Миграция: добавлена колонка status в requests")
+        # Проверка схемы после миграции
         if not _column_exists(conn, "requests", "status"):
-            conn.execute("ALTER TABLE requests ADD COLUMN status TEXT DEFAULT 'new'")
-            logger.info("Миграция: добавлена колонка status в requests")
+            raise RuntimeError("Миграция status не применилась — схема повреждена")
+
+
+def init_db():
+    """Инициализирует БД: создаёт таблицы, мигрирует схему, заполняет пустые справочники.
+
+    Порядок миграции существующей БД (идемпотентно):
+    1) диагностика необходимости миграции (без записи);
+    2) закрытие диагностического соединения;
+    3) резервная копия + проверка;
+    4) если копия не создана/не прошла проверку — миграция останавливается;
+    5) новое соединение → миграция (колонка status — ДО executescript:
+       индексы _SCHEMA ссылаются на status);
+    6) проверка схемы (повторный init_db безопасен).
+    Для новой пустой БД резервная копия перед созданием схемы не нужна.
+    """
+    if _needs_status_migration():
+        backup_path = backup_db()
+        if not backup_path or not verify_backup(backup_path):
+            raise RuntimeError(
+                "Резервная копия перед миграцией не создана или не прошла "
+                "проверку — миграция остановлена (см. журнал)"
+            )
+        logger.info(f"Резервная копия перед миграцией: {backup_path}")
+
+    with get_conn() as conn:
+        # Постоянный режим WAL выставляется здесь, один раз на запуск,
+        # а не при каждом коротком соединении.
+        conn.execute("PRAGMA journal_mode=WAL")
+        # 1) Колоночная миграция старой таблицы — до индексов _SCHEMA.
+        _ensure_status_column(conn)
+        conn.executescript(_SCHEMA)
+        # 2) Страховка для любых иных порядков (новая БД — no-op).
+        _ensure_status_column(conn)
 
         # Миграция: UNIQUE на telegram_id в initiator_users
         try:
@@ -422,9 +495,16 @@ def update_request_status(
     user_name: str = "",
 ) -> bool:
     """Обновляет статус заявки. Возвращает True если успешно.
-    Синхронизирует done_date: ставит today при done, очищает при reopen."""
+    Синхронизирует done_date: ставит today при done, очищает при reopen.
+
+    Отмена/восстановление НЕ выполняются этим путём: перевод в cancelled
+    только через cancel_request(); переходы из cancelled не предлагаются.
+    """
     if new_status not in VALID_STATUSES:
         logger.warning(f"Недопустимый статус: {new_status}")
+        return False
+    if new_status == "cancelled":
+        logger.warning("Перевод в cancelled возможен только через cancel_request")
         return False
     with get_conn() as conn:
         row = conn.execute(
@@ -433,6 +513,11 @@ def update_request_status(
         if not row:
             return False
         old_status = row["status"]
+        if old_status == "cancelled":
+            logger.warning(
+                "Переходы из cancelled через update_request_status запрещены"
+            )
+            return False
         if old_status == new_status:
             return True
         # Синхронизация done_date с переходами статуса
@@ -576,11 +661,11 @@ def get_requests_by_status(status: Optional[str] = None, limit: int = 50) -> Lis
 
 
 def get_dashboard_counts() -> dict:
-    """Возвращает счётчики для дашборда."""
+    """Возвращает счётчики для дашборда (только активные: new/ordered/delivered)."""
     with get_conn() as conn:
-        total_active = conn.execute(
-            "SELECT COUNT(*) FROM requests WHERE done_date IS NULL AND status != 'archived'"
-        ).fetchone()[0]
+        total_active = conn.execute("""SELECT COUNT(*) FROM requests
+               WHERE done_date IS NULL
+               AND status IN ('new', 'ordered', 'delivered')""").fetchone()[0]
         by_status = {}
         for st in ("new", "ordered", "delivered"):
             count = conn.execute(
@@ -589,7 +674,7 @@ def get_dashboard_counts() -> dict:
             by_status[st] = count
         overdue = conn.execute("""SELECT COUNT(*) FROM requests
                WHERE done_date IS NULL AND status != 'archived'
-               AND status NOT IN ('done', 'delivered')
+               AND status NOT IN ('done', 'delivered', 'cancelled')
                AND request_date < date('now', '-' || COALESCE(
                    (SELECT value FROM settings WHERE key = 'overdue_days'), '3'
                ) || ' days')""").fetchone()[0]
@@ -627,13 +712,16 @@ def archive_completed_requests(days_old: int = 90) -> int:
 
 
 def get_active_requests() -> List[dict]:
-    """Возвращает активные заявки (без done_date, status != archived), отсортированные по объекту."""
+    """Возвращает активные заявки (new/ordered/delivered, без done_date).
+
+    Отменённые (cancelled) и архивные сюда не входят.
+    """
     with get_conn() as conn:
         rows = conn.execute("""SELECT id, name, quantity, unit, request_date, done_date,
                       initiator, status, object, notes
                FROM requests
                WHERE done_date IS NULL AND request_date IS NOT NULL
-               AND status != 'archived'
+               AND status IN ('new', 'ordered', 'delivered')
                ORDER BY object, request_date""").fetchall()
     return [dict(r) for r in rows]
 
@@ -775,7 +863,10 @@ def complete_request(
     user_id: Optional[int] = None,
     user_name: str = "",
 ) -> Optional[dict]:
-    """Отмечает заявку как выполненную. Идемпотентна — не перезаписывает done_date."""
+    """Отмечает заявку как выполненную. Идемпотентна — не перезаписывает done_date.
+
+    Отменённые (cancelled) и архивные заявки завершить нельзя.
+    """
     with get_conn() as conn:
         row = conn.execute(
             "SELECT * FROM requests WHERE id = ?", (request_id,)
@@ -786,13 +877,20 @@ def complete_request(
         # Идемпотентность: не перезаписываем, если уже завершена
         if row["done_date"]:
             return result
+        if row["status"] in ("cancelled", "archived"):
+            # Перечитывать не нужно — состояние уже известно, отклоняем.
+            logger.info(
+                f"Заявка #{request_id} не может быть завершена: {row['status']}"
+            )
+            return None
         cursor = conn.execute(
             "UPDATE requests SET done_date = ?, status = 'done' "
-            "WHERE id = ? AND done_date IS NULL",
+            "WHERE id = ? AND done_date IS NULL "
+            "AND status NOT IN ('cancelled', 'archived')",
             (done_date.isoformat(), request_id),
         )
         if cursor.rowcount == 0:
-            # Другой writer уже завершил — перечитываем
+            # Другой writer уже завершил или изменил статус — перечитываем
             row = conn.execute(
                 "SELECT * FROM requests WHERE id = ?", (request_id,)
             ).fetchone()
@@ -813,7 +911,8 @@ def complete_requests_batch(
     user_name: str = "",
 ) -> int:
     """Завершает несколько заявок одним SQL. Возвращает количество завершённых.
-    Атомарно: UPDATE ... WHERE id IN (...) AND done_date IS NULL."""
+    Атомарно: UPDATE ... WHERE id IN (...) AND done_date IS NULL AND
+    status NOT IN ('cancelled', 'archived')."""
     if not request_ids:
         return 0
     placeholders = ",".join("?" * len(request_ids))
@@ -822,7 +921,8 @@ def complete_requests_batch(
         cursor = conn.execute(
             f"""UPDATE requests
                 SET done_date = ?, status = 'done'
-                WHERE id IN ({placeholders}) AND done_date IS NULL""",
+                WHERE id IN ({placeholders}) AND done_date IS NULL
+                  AND status NOT IN ('cancelled', 'archived')""",
             [done_str] + list(request_ids),
         )
         completed = cursor.rowcount
@@ -837,14 +937,66 @@ def complete_requests_batch(
     return completed
 
 
+def cancel_request(
+    request_id: int,
+    user_id: Optional[int] = None,
+    user_name: str = "",
+    comment: str = "",
+) -> Tuple[Optional[dict], bool]:
+    """Отменяет активную заявку: status='cancelled', без удаления.
+
+    Возвращает (строка, changed):
+    - (row, True) — отмена выполнена (первый раз), записан audit;
+    - (row, False) — без изменений: уже отменена (идемпотентно, без
+      повторного audit) либо нельзя отменить — различайте по row['status'];
+    - (None, False) — заявка не найдена.
+
+    done_date не меняется; физическое удаление не используется.
+    """
+    with get_conn() as conn:
+        cursor = conn.execute(
+            """UPDATE requests SET status = 'cancelled'
+               WHERE id = ? AND done_date IS NULL
+                 AND status IN ('new', 'ordered', 'delivered')""",
+            (request_id,),
+        )
+        changed = cursor.rowcount > 0
+        row = conn.execute(
+            "SELECT * FROM requests WHERE id = ?", (request_id,)
+        ).fetchone()
+        result = dict(row) if row else None
+    if result is None:
+        return None, False
+    if not changed:
+        # Уже отменена → идемпотентно; done/archived → отклонено (нет строки
+        # с активным статусом — ниже вызывающий код отличает по status).
+        logger.info(
+            f"cancel_request #{request_id}: без изменений (status={result['status']})"
+        )
+        return result, False
+    logger.info(f"Заявка #{request_id} отменена")
+    audit_log(
+        request_id,
+        user_id,
+        user_name,
+        "cancelled",
+        comment.strip() or "Отменена без комментария",
+    )
+    return result, True
+
+
 def get_completed_requests(limit: int = 50) -> List[dict]:
-    """Возвращает завершённые заявки (есть done_date), отсортированные по дате завершения."""
+    """Возвращает выполненные заявки (status='done'), по дате завершения.
+
+    Используется для Telegram-отчётов; лимит явный (по умолчанию 50).
+    Отменённые и архивные сюда не входят.
+    """
     with get_conn() as conn:
         rows = conn.execute(
             """SELECT id, name, quantity, unit, request_date, done_date,
                       initiator, status, object, notes
                FROM requests
-               WHERE done_date IS NOT NULL AND status != 'archived'
+               WHERE status = 'done' AND done_date IS NOT NULL
                ORDER BY done_date DESC
                LIMIT ?""",
             (limit,),
@@ -885,14 +1037,20 @@ def is_request_owner(request_id: int, telegram_id: int) -> bool:
 def get_user_requests(
     initiator: str, status_filter: Optional[str] = None, limit: int = 50
 ) -> List[dict]:
-    """Возвращает заявки конкретного инициатора."""
+    """Возвращает заявки конкретного инициатора.
+
+    active — только новые/заказанные/доставленные (cancelled исключены);
+    completed — только status='done'; без фильтра — история (включая
+    отменённые, чтобы инициатор видел результат).
+    """
     with get_conn() as conn:
         if status_filter and status_filter == "active":
             rows = conn.execute(
                 """SELECT id, name, quantity, unit, request_date, done_date,
                           initiator, status, object, notes
                    FROM requests
-                   WHERE initiator = ? AND done_date IS NULL AND status != 'archived'
+                   WHERE initiator = ? AND done_date IS NULL
+                     AND status IN ('new', 'ordered', 'delivered')
                    ORDER BY request_date DESC LIMIT ?""",
                 (initiator, limit),
             ).fetchall()
@@ -901,7 +1059,8 @@ def get_user_requests(
                 """SELECT id, name, quantity, unit, request_date, done_date,
                           initiator, status, object, notes
                    FROM requests
-                   WHERE initiator = ? AND done_date IS NOT NULL AND status != 'archived'
+                   WHERE initiator = ? AND status = 'done'
+                     AND done_date IS NOT NULL
                    ORDER BY done_date DESC LIMIT ?""",
                 (initiator, limit),
             ).fetchall()
