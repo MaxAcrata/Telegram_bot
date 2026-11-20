@@ -1,12 +1,16 @@
 import asyncio
 import json
 import logging
+from time import monotonic as _monotonic
+from typing import Awaitable, Callable, NamedTuple, Optional
 
 # Маркер сборки — виден в логах Amvera, чтобы понимать, какая версия запущена.
 APP_VERSION = "2026-10-22.a4af99e"
 from datetime import time, datetime, date
 from html import escape
 from zoneinfo import ZoneInfo
+
+import httpx
 from telegram import (
     Update,
     ReplyKeyboardMarkup,
@@ -23,7 +27,13 @@ from telegram.ext import (
     filters,
     CallbackQueryHandler,
 )
-from telegram.error import RetryAfter, TelegramError
+from telegram.error import (
+    BadRequest,
+    NetworkError,
+    RetryAfter,
+    TelegramError,
+    TimedOut,
+)
 from telegram.request import HTTPXRequest
 
 from config import (
@@ -39,6 +49,13 @@ from config import (
     MAX_PHOTOS_PER_REQUEST,
     REPORT_TIMEZONE,
     OVERDUE_DAYS,
+    CONVERSATION_TIMEOUT_SEC,
+    HTTP_CONNECT_TIMEOUT,
+    HTTP_READ_TIMEOUT,
+    HTTP_WRITE_TIMEOUT,
+    HTTP_POOL_TIMEOUT,
+    HTTP_GETUPDATES_READ_TIMEOUT,
+    HTTP_API_POOL_SIZE,
 )
 from core import build_report, build_dashboard
 from db import (
@@ -267,61 +284,308 @@ def get_main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 
-async def _safe_reply(update, text, **kwargs):
-    """Отправляет сообщение с обработкой RetryAfter."""
-    try:
-        return await update.message.reply_text(text, **kwargs)
-    except RetryAfter as e:
-        logger.warning(f"RetryAfter: ждём {e.retry_after} сек")
-        await asyncio.sleep(e.retry_after)
-        return await update.message.reply_text(text, **kwargs)
-    except TelegramError as e:
-        logger.error(f"TelegramError в _safe_reply: {e}")
+# ===== СЕТЕВЫЕ ВЫЗОВЫ TELEGRAM =====
+# Отдельный небольшой пул соединений для getUpdates (long polling).
+_GETUPDATES_POOL_SIZE = 4
 
 
-async def _safe_send(context, chat_id, text, **kwargs):
-    """Отправляет сообщение с обработкой RetryAfter."""
-    try:
-        return await context.bot.send_message(chat_id=chat_id, text=text, **kwargs)
-    except RetryAfter as e:
-        logger.warning(f"RetryAfter: ждём {e.retry_after} сек")
-        await asyncio.sleep(e.retry_after)
-        return await context.bot.send_message(chat_id=chat_id, text=text, **kwargs)
-    except TelegramError as e:
-        logger.error(f"TelegramError в _safe_send: {e}")
+class TelegramCallResult(NamedTuple):
+    """Явный результат сетевого вызова Telegram API.
+
+    success: True — вызов достоверно успешен.
+    delivery_uncertain: True — исход доставки неизвестен (read/write timeout
+        и т.п.): Telegram мог принять сообщение, слепой повтор запрещён.
+    value: объект Telegram (Message) либо True при успехе, иначе None.
+    error: исходное исключение при провале.
+    """
+
+    success: bool
+    delivery_uncertain: bool
+    value: object
+    error: Optional[BaseException]
 
 
-async def _safe_edit(query, text, **kwargs):
-    """Редактирует сообщение с обработкой RetryAfter."""
-    try:
-        return await query.edit_message_text(text, **kwargs)
-    except RetryAfter as e:
-        logger.warning(f"RetryAfter: ждём {e.retry_after} сек")
-        await asyncio.sleep(e.retry_after)
-        return await query.edit_message_text(text, **kwargs)
-    except TelegramError as e:
-        logger.error(f"TelegramError в _safe_edit: {e}")
+# Лимиты повторов: все конечны (политика A5).
+_RETRY_AFTER_REPEATS = {"send": 2, "edit": 2, "answer": 1}
+_CONNECT_REPEATS = {"send": 1, "edit": 1, "answer": 1}
+_UNCERTAIN_REPEATS = {"edit": 1}  # edit_message_text идемпотентен
 
 
-async def _safe_callback_reply(update, text, **kwargs):
-    """Отправляет ответ в контексте callback (без update.message)."""
-    try:
-        chat_id = None
-        if (
-            hasattr(update, "callback_query")
-            and update.callback_query
-            and update.callback_query.message
-        ):
-            chat_id = update.callback_query.message.chat_id
-        elif hasattr(update, "effective_chat") and update.effective_chat:
-            chat_id = update.effective_chat.id
-        if chat_id:
-            # Используем bot.send_message напрямую
-            await update.callback_query.message.chat.send_message(text, **kwargs)
-            return
-        logger.error("_safe_callback_reply: не удалось определить chat_id")
-    except TelegramError as e:
-        logger.error(f"TelegramError в _safe_callback_reply: {e}")
+def _cause_chain(exc: BaseException):
+    """Обходит __cause__/__context__ без зацикливания."""
+    seen = set()
+    node = exc.__cause__ or exc.__context__
+    while node is not None and id(node) not in seen:
+        seen.add(id(node))
+        yield node
+        node = node.__cause__ or node.__context__
+
+
+def _network_kind(exc: BaseException) -> str:
+    """Классифицирует первопричину сетевой ошибки: connect|read|write|pool|unknown."""
+    for node in _cause_chain(exc):
+        if isinstance(node, httpx.PoolTimeout):
+            return "pool"
+        if isinstance(node, httpx.ConnectTimeout):
+            return "connect"
+        if isinstance(node, httpx.ReadTimeout):
+            return "read"
+        if isinstance(node, httpx.WriteTimeout):
+            return "write"
+        if isinstance(node, httpx.ConnectError):
+            return "connect"
+        if isinstance(node, httpx.ReadError):
+            return "read"
+        if isinstance(node, httpx.WriteError):
+            return "write"
+    return "unknown"
+
+
+def _cause_name(exc: BaseException) -> str:
+    """Имя класса первопричины для журнала ('-' если отсутствует)."""
+    for node in _cause_chain(exc):
+        return type(node).__name__
+    return "-"
+
+
+def _log_op(
+    op: str,
+    *,
+    user_id: Optional[int] = None,
+    chat_id: Optional[int] = None,
+    attempt: Optional[int] = None,
+    duration_ms: Optional[int] = None,
+    success: Optional[bool] = None,
+    error: Optional[BaseException] = None,
+    state_before: object = None,
+    state_after: object = None,
+    flow: Optional[str] = None,
+    detail: Optional[str] = None,
+) -> None:
+    """Структурированная диагностика операции.
+
+    Не содержит токен, пароли прокси, тексты комментариев и полные user_data.
+    """
+    parts = [f"op={op}"]
+    if user_id is not None:
+        parts.append(f"user_id={user_id}")
+    if chat_id is not None:
+        parts.append(f"chat_id={chat_id}")
+    if flow:
+        parts.append(f"flow={flow}")
+    if state_before is not None:
+        parts.append(f"state_before={state_before}")
+    if state_after is not None:
+        parts.append(f"state_after={state_after}")
+    if attempt is not None:
+        parts.append(f"attempt={attempt}")
+    if duration_ms is not None:
+        parts.append(f"duration_ms={duration_ms}")
+    if success is not None:
+        parts.append(f"ok={success}")
+    if error is not None:
+        parts.append(f"error={type(error).__name__}")
+        if isinstance(error, TimedOut):
+            parts.append(f"cause={_cause_name(error)} kind={_network_kind(error)}")
+    if detail:
+        parts.append(f"detail={detail}")
+    line = " ".join(parts)
+    if success is None:
+        logger.info(line)
+    elif success:
+        logger.debug(line)
+    else:
+        logger.warning(line)
+
+
+async def _tg_call(
+    op: str,
+    factory: Callable[[], Awaitable[object]],
+    *,
+    kind: str,
+    user_id: Optional[int] = None,
+    chat_id: Optional[int] = None,
+) -> TelegramCallResult:
+    """Выполняет сетевой вызов Telegram с конечными повторами.
+
+    kind: 'send' | 'edit' | 'answer' — определяет бюджет повторов.
+    Повторы: RetryAfter — ждём retry_after; connect/pool — повтор без риска
+    дубля; read/write — для send повтор запрещён (доставка неизвестна),
+    для edit допущен один идемпотентный повтор; постоянные ошибки не
+    повторяются.
+    """
+    retry_after_left = _RETRY_AFTER_REPEATS[kind]
+    connect_left = _CONNECT_REPEATS[kind]
+    uncertain_left = _UNCERTAIN_REPEATS.get(kind, 0)
+    attempt = 0
+    while True:
+        attempt += 1
+        started = _monotonic()
+        try:
+            value = await factory()
+            duration_ms = int((_monotonic() - started) * 1000)
+            _log_op(
+                op,
+                user_id=user_id,
+                chat_id=chat_id,
+                attempt=attempt,
+                duration_ms=duration_ms,
+                success=True,
+            )
+            return TelegramCallResult(True, False, value, None)
+        except RetryAfter as e:
+            delay = float(e.retry_after)
+            _log_op(
+                op,
+                user_id=user_id,
+                chat_id=chat_id,
+                attempt=attempt,
+                success=False,
+                error=e,
+                detail=f"retry_after={delay}",
+            )
+            if retry_after_left <= 0:
+                return TelegramCallResult(False, False, None, e)
+            retry_after_left -= 1
+            await asyncio.sleep(delay)
+        except TimedOut as e:
+            duration_ms = int((_monotonic() - started) * 1000)
+            network = _network_kind(e)
+            _log_op(
+                op,
+                user_id=user_id,
+                chat_id=chat_id,
+                attempt=attempt,
+                duration_ms=duration_ms,
+                success=False,
+                error=e,
+            )
+            if network in ("connect", "pool") and connect_left > 0:
+                connect_left -= 1
+                continue
+            if network in ("connect", "pool"):
+                # Гарантированно не отправлено — безопасно завершить.
+                return TelegramCallResult(False, False, None, e)
+            if network in ("read", "write"):
+                if kind == "edit" and uncertain_left > 0:
+                    uncertain_left -= 1
+                    continue
+                # send/answer: слепой повтор запрещён — исход неизвестен.
+                return TelegramCallResult(False, True, None, e)
+            return TelegramCallResult(False, True, None, e)
+        # BadRequest — наследник NetworkError в PTB 20.7: ветка должна идти
+        # РАНЬШЕ NetworkError, иначе она недостижима и ошибки классификации.
+        except BadRequest as e:
+            duration_ms = int((_monotonic() - started) * 1000)
+            if kind == "edit" and "Message is not modified" in str(e):
+                _log_op(
+                    op,
+                    user_id=user_id,
+                    chat_id=chat_id,
+                    attempt=attempt,
+                    success=True,
+                    detail="message not modified",
+                )
+                return TelegramCallResult(True, False, True, e)
+            _log_op(
+                op,
+                user_id=user_id,
+                chat_id=chat_id,
+                attempt=attempt,
+                duration_ms=duration_ms,
+                success=False,
+                error=e,
+                detail="permanent",
+            )
+            return TelegramCallResult(False, False, None, e)
+        except NetworkError as e:
+            duration_ms = int((_monotonic() - started) * 1000)
+            network = _network_kind(e)
+            _log_op(
+                op,
+                user_id=user_id,
+                chat_id=chat_id,
+                attempt=attempt,
+                duration_ms=duration_ms,
+                success=False,
+                error=e,
+            )
+            if network == "connect" and connect_left > 0:
+                connect_left -= 1
+                continue
+            if network == "connect":
+                return TelegramCallResult(False, False, None, e)
+            if kind == "edit" and network in ("read", "write") and uncertain_left > 0:
+                uncertain_left -= 1
+                continue
+            uncertain = network in ("read", "write", "unknown")
+            return TelegramCallResult(False, uncertain, None, e)
+        except TelegramError as e:
+            duration_ms = int((_monotonic() - started) * 1000)
+            _log_op(
+                op,
+                user_id=user_id,
+                chat_id=chat_id,
+                attempt=attempt,
+                success=False,
+                error=e,
+                detail="permanent",
+            )
+            return TelegramCallResult(False, False, None, e)
+
+
+def _update_ids(update) -> tuple:
+    """user_id/chat_id из обновления для журнала (без падений на None)."""
+    user_id = getattr(update, "effective_user", None)
+    chat_id = getattr(update, "effective_chat", None)
+    return (
+        getattr(user_id, "id", None),
+        getattr(chat_id, "id", None),
+    )
+
+
+async def _safe_reply(update, text, **kwargs) -> TelegramCallResult:
+    """Отправляет ответ в чат обновления; явный результат доставки."""
+    user_id, chat_id = _update_ids(update)
+    return await _tg_call(
+        "_safe_reply",
+        lambda: update.message.reply_text(text, **kwargs),
+        kind="send",
+        user_id=user_id,
+        chat_id=chat_id,
+    )
+
+
+async def _safe_send(context, chat_id, text, **kwargs) -> TelegramCallResult:
+    """Отправляет сообщение в указанный чат; явный результат доставки."""
+    return await _tg_call(
+        "_safe_send",
+        lambda: context.bot.send_message(chat_id=chat_id, text=text, **kwargs),
+        kind="send",
+        chat_id=chat_id,
+    )
+
+
+async def _safe_edit(query, text, **kwargs) -> TelegramCallResult:
+    """Редактирует сообщение; явный результат. Идемпотентно — повторы разрешены."""
+    user_id = getattr(getattr(query, "from_user", None), "id", None)
+    return await _tg_call(
+        "_safe_edit",
+        lambda: query.edit_message_text(text, **kwargs),
+        kind="edit",
+        user_id=user_id,
+    )
+
+
+async def _safe_answer(query, text=None, **kwargs) -> TelegramCallResult:
+    """Отвечает на callback-запрос (best-effort, короткий повтор)."""
+    user_id = getattr(getattr(query, "from_user", None), "id", None)
+    return await _tg_call(
+        "_safe_answer",
+        lambda: query.answer(text, **kwargs),
+        kind="answer",
+        user_id=user_id,
+    )
 
 
 async def send_long_message(
@@ -451,7 +715,7 @@ async def show_request_photos(update: Update, context: ContextTypes.DEFAULT_TYPE
     """Отправляет фото заявки по нажатию inline-кнопки.
     Проверка прав: только админ или инициатор заявки."""
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
 
     user_id = update.effective_user.id
     req_id = int(query.data.split(":")[1])
@@ -469,24 +733,18 @@ async def show_request_photos(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     for file_id in file_ids:
-        try:
-            await context.bot.send_photo(
+        result = await _tg_call(
+            "send_photo",
+            lambda: context.bot.send_photo(
                 chat_id=query.message.chat_id,
                 photo=file_id,
                 disable_notification=True,
-            )
-        except RetryAfter as e:
-            await asyncio.sleep(e.retry_after)
-            try:
-                await context.bot.send_photo(
-                    chat_id=query.message.chat_id,
-                    photo=file_id,
-                    disable_notification=True,
-                )
-            except Exception as e2:
-                logger.warning(f"Не удалось отправить фото после retry: {e2}")
-        except Exception as e:
-            logger.warning(f"Не удалось отправить фото {file_id}: {e}")
+            ),
+            kind="send",
+            chat_id=query.message.chat_id,
+        )
+        if not result.success:
+            logger.warning(f"Не удалось отправить фото: {result.error}")
             await _safe_send(
                 context, query.message.chat_id, "⚠️ Не удалось отправить одно из фото."
             )
@@ -496,7 +754,7 @@ async def show_request_details(update: Update, context: ContextTypes.DEFAULT_TYP
     """Показывает детали заявки по нажатию inline-кнопки из отчёта.
     Проверка прав: только админ или инициатор заявки."""
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
 
     user_id = update.effective_user.id
     req_id = int(query.data.split(":")[1])
@@ -725,6 +983,8 @@ async def scheduled_report(context: ContextTypes.DEFAULT_TYPE):
         logger.warning(f"Отчёт для chat_id={chat_id} уже выполняется — пропускаем")
         return
     context.bot_data[report_flag] = True
+    started = _monotonic()
+    _log_op("scheduled_report:started", chat_id=chat_id)
 
     try:
         result, ids_with_photos, all_ids, requests_data = build_report()
@@ -732,7 +992,20 @@ async def scheduled_report(context: ContextTypes.DEFAULT_TYPE):
         await send_long_message(
             context, chat_id, result, parse_mode="HTML", reply_markup=keyboard
         )
+        _log_op(
+            "scheduled_report:finished",
+            chat_id=chat_id,
+            duration_ms=int((_monotonic() - started) * 1000),
+            success=True,
+        )
     except Exception as e:
+        _log_op(
+            "scheduled_report:failed",
+            chat_id=chat_id,
+            duration_ms=int((_monotonic() - started) * 1000),
+            success=False,
+            error=e,
+        )
         logger.error(f"Ошибка автоотчёта: {e}", exc_info=True)
         try:
             await _safe_send(context, chat_id, "❌ Ошибка при формировании автоотчёта.")
@@ -740,6 +1013,32 @@ async def scheduled_report(context: ContextTypes.DEFAULT_TYPE):
             pass
     finally:
         context.bot_data[report_flag] = False
+
+
+async def archive_old_requests_job(context: ContextTypes.DEFAULT_TYPE):
+    """Ежедневное архивирование старых завершённых заявок (job с журналом)."""
+    from db import archive_completed_requests
+
+    started = _monotonic()
+    _log_op("archive_old_requests:started")
+    try:
+        count = archive_completed_requests()
+    except Exception as e:
+        _log_op(
+            "archive_old_requests:failed",
+            duration_ms=int((_monotonic() - started) * 1000),
+            success=False,
+            error=e,
+        )
+        raise
+    _log_op(
+        "archive_old_requests:finished",
+        duration_ms=int((_monotonic() - started) * 1000),
+        success=True,
+        detail=f"archived={count}",
+    )
+    if count:
+        logger.info(f"Автоматическое архивирование: {count} заявок")
 
 
 # ===== CONVERSATION HANDLER =====
@@ -1572,7 +1871,7 @@ async def analysis_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def analysis_filter_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Генерирует отчёт по выбранному фильтру"""
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
     mode = query.data.split(":")[1]
 
     await _safe_edit(query, "⏳ Формирую отчёт...")
@@ -1673,7 +1972,7 @@ async def _show_complete_page(update_or_query, context, page: int):
 async def complete_page_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка пагинации в завершении заявок"""
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
     page = int(query.data.split(":")[1])
     return await _show_complete_page(update, context, page)
 
@@ -1681,7 +1980,7 @@ async def complete_page_handler(update: Update, context: ContextTypes.DEFAULT_TY
 async def complete_batch_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Массовое завершение заявок на текущей странице"""
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
     page = int(query.data.split(":")[1])
 
     requests = context.user_data.get("complete_requests", [])
@@ -1746,7 +2045,7 @@ async def complete_select_handler(update: Update, context: ContextTypes.DEFAULT_
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
     req_id = int(query.data.split(":")[1])
 
     selected = get_request_by_id(req_id)
@@ -1785,14 +2084,14 @@ async def complete_comment_handler(update: Update, context: ContextTypes.DEFAULT
     data = query.data
 
     if data == "cr:cancel":
-        await query.answer()
+        await _safe_answer(query)
         context.user_data.pop("complete_request", None)
         context.user_data.pop("complete_comment", None)
         await _safe_edit(query, "❌ Отменено.")
         return ConversationHandler.END
 
     if data == "cr:nocomment":
-        await query.answer()
+        await _safe_answer(query)
         context.user_data["complete_comment"] = ""
         return await _show_complete_final(query, context)
 
@@ -1885,7 +2184,7 @@ async def complete_confirm_handler(update: Update, context: ContextTypes.DEFAULT
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
     data = query.data
 
     if data == "cr:cancel":
@@ -2046,7 +2345,7 @@ async def _show_status_page(update_or_query, context, page: int):
 async def status_page_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Пагинация для смены статуса"""
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
     page = int(query.data.split(":")[1])
     return await _show_status_page(update, context, page)
 
@@ -2054,7 +2353,7 @@ async def status_page_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def status_select_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает варианты нового статуса"""
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
     req_id = int(query.data.split(":")[1])
 
     req = get_request_by_id(req_id)
@@ -2090,7 +2389,7 @@ async def status_select_handler(update: Update, context: ContextTypes.DEFAULT_TY
 async def status_confirm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Применяет новый статус"""
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
     new_status = query.data.split(":")[1]
 
     if new_status == "cancel":
@@ -2215,7 +2514,7 @@ async def _show_my_requests_page(update_or_query, context):
 async def my_requests_page_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Пагинация «Моих заявок»"""
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
     direction = query.data.split(":")[1]
     page = context.user_data.get("my_page", 0)
     if direction == "next":
@@ -2230,7 +2529,7 @@ async def my_requests_refresh_handler(
 ):
     """Обновляет «Мои заявки»"""
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
 
     user_id = update.effective_user.id
     linked_name = get_initiator_by_tg_id(user_id)
@@ -2251,7 +2550,7 @@ async def my_requests_search_handler(
 ):
     """Запрашивает поисковый запрос"""
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
     await _safe_edit(query, "🔍 Введите поисковый запрос (наименование или фрагмент):")
     context.user_data["awaiting_search"] = True
     return MY_REQUESTS_SELECT
@@ -2379,7 +2678,7 @@ async def admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
     data = query.data
 
     if data == "buttons":
@@ -2405,7 +2704,7 @@ async def admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def admin_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Создаёт резервную копию БД"""
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
 
     path = backup_db()
     if path:
@@ -2427,7 +2726,7 @@ async def admin_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def admin_show_audit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает последние записи журнала аудита"""
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
 
     entries = get_audit_log(limit=15)
     if not entries:
@@ -2506,7 +2805,7 @@ async def admin_list_view_handler(update: Update, context: ContextTypes.DEFAULT_
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
     data = query.data
     list_type = context.user_data.get("admin_list_type", "object")
 
@@ -2626,7 +2925,7 @@ async def admin_delete_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
     data = query.data
     list_type = context.user_data.get("admin_list_type", "object")
 
@@ -2643,9 +2942,9 @@ async def admin_delete_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 "list_deleted",
                 f"{list_type}: {value}",
             )
-            await query.answer(f"Удалено: {value}", show_alert=True)
+            await _safe_answer(query, f"Удалено: {value}", show_alert=True)
         else:
-            await query.answer("⚠️ Значение не найдено.", show_alert=True)
+            await _safe_answer(query, "⚠️ Значение не найдено.", show_alert=True)
 
     return await _show_list(update, context, list_type)
 
@@ -2698,7 +2997,7 @@ async def admin_buttons_edit_handler(
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
     data = query.data
     list_type = context.user_data.get("admin_list_type", "object")
 
@@ -2706,9 +3005,9 @@ async def admin_buttons_edit_handler(
         n = int(data.split(":")[1])
         if 1 <= n <= 6:
             set_setting(f"buttons_per_row_{list_type}", str(n))
-            await query.answer(f"Установлено: {n} в строке", show_alert=True)
+            await _safe_answer(query, f"Установлено: {n} в строке", show_alert=True)
         else:
-            await query.answer("Значение должно быть от 1 до 6", show_alert=True)
+            await _safe_answer(query, "Значение должно быть от 1 до 6", show_alert=True)
 
     return await _show_list(update, context, list_type)
 
@@ -2780,7 +3079,7 @@ async def _show_list_msg(
 async def admin_clear_db_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает подтверждение очистки БД"""
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
 
     keyboard = [
         [
@@ -2806,7 +3105,7 @@ async def admin_clear_db_execute(update: Update, context: ContextTypes.DEFAULT_T
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
     data = query.data
 
     if data == "clear_db:cancel":
@@ -2890,7 +3189,7 @@ async def dashboard_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def dashboard_reqs_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик кнопки «Все заявки» на дашборде — открывает список заявок."""
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
     if not is_admin(update.effective_user.id):
         return
     context.user_data["req_filter"] = None
@@ -2900,7 +3199,7 @@ async def dashboard_reqs_callback(update: Update, context: ContextTypes.DEFAULT_
 async def dashboard_report_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик кнопки «Отчёт» на дашборде — генерирует отчёт."""
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
     if not is_admin(update.effective_user.id):
         return
     mode = query.data.split(":")[1]
@@ -3027,7 +3326,7 @@ def _status_emoji(status: str) -> str:
 async def requests_filter_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обрабатывает фильтр по статусу."""
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
     filter_val = query.data.split(":")[1]
     context.user_data["req_filter"] = None if filter_val == "none" else filter_val
     return await _show_requests_list(update, context, 0)
@@ -3036,7 +3335,7 @@ async def requests_filter_handler(update: Update, context: ContextTypes.DEFAULT_
 async def requests_page_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Пагинация списка заявок."""
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
     page = int(query.data.split(":")[1])
     return await _show_requests_list(update, context, page)
 
@@ -3044,7 +3343,7 @@ async def requests_page_handler(update: Update, context: ContextTypes.DEFAULT_TY
 async def requests_card_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает карточку заявки с действиями."""
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
     req_id = int(query.data.split(":")[1])
 
     req = get_request_by_id(req_id)
@@ -3117,12 +3416,12 @@ async def requests_card_handler(update: Update, context: ContextTypes.DEFAULT_TY
     user_id = update.effective_user.id
 
     if data == "reqback":
-        await query.answer()
+        await _safe_answer(query)
         return await _show_requests_list(update, context, 0)
 
     if data.startswith("reqst:"):
         # Смена статуса — перенаправляем в status flow
-        await query.answer()
+        await _safe_answer(query)
         req_id = int(data.split(":")[1])
         req = get_request_by_id(req_id)
         if not req:
@@ -3156,7 +3455,7 @@ async def requests_card_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
     if data.startswith("reqssc:"):
         # Подтверждение смены статуса
-        await query.answer()
+        await _safe_answer(query)
         new_status = data.split(":")[1]
         req = context.user_data.get("status_request")
         if not req:
@@ -3181,7 +3480,7 @@ async def requests_card_handler(update: Update, context: ContextTypes.DEFAULT_TY
         return ConversationHandler.END
 
     if data == "reqsscancel":
-        await query.answer()
+        await _safe_answer(query)
         context.user_data.pop("status_request", None)
         req = context.user_data.get("card_request")
         if req:
@@ -3191,7 +3490,7 @@ async def requests_card_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
     if data.startswith("reqe:"):
         # Редактирование — переход к выбору поля
-        await query.answer()
+        await _safe_answer(query)
         req_id = int(data.split(":")[1])
         req = get_request_by_id(req_id)
         if not req:
@@ -3249,7 +3548,7 @@ async def requests_card_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
     if data.startswith("editf:"):
         # Выбор поля → запрос нового значения
-        await query.answer()
+        await _safe_answer(query)
         field = data.split(":")[1]
         context.user_data["edit_field"] = field
         field_names = {
@@ -3304,12 +3603,12 @@ async def requests_card_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
     if data == "editcancel":
         # Завершаем редактирование (для обратной совместимости)
-        await query.answer()
+        await _safe_answer(query)
         return await _finish_editing(update, context, update.effective_user.id)
 
     if data.startswith("reqdel:"):
         # Удаление — запрос подтверждения
-        await query.answer()
+        await _safe_answer(query)
         req_id = int(data.split(":")[1])
         req = get_request_by_id(req_id)
         if not req:
@@ -3337,7 +3636,7 @@ async def requests_card_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
     if data.startswith("reqdelyes:"):
         # Подтверждение удаления
-        await query.answer()
+        await _safe_answer(query)
         req_id = int(data.split(":")[1])
         success = delete_request(
             req_id,
@@ -3353,7 +3652,7 @@ async def requests_card_handler(update: Update, context: ContextTypes.DEFAULT_TY
         return ConversationHandler.END
 
     if data == "reqdelno":
-        await query.answer()
+        await _safe_answer(query)
         context.user_data.pop("delete_request", None)
         req = context.user_data.get("card_request")
         if req:
@@ -3367,7 +3666,7 @@ async def requests_card_handler(update: Update, context: ContextTypes.DEFAULT_TY
 async def edit_next_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик кнопки 'Вперёд' при редактировании."""
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
     user_id = update.effective_user.id
     req = context.user_data.get("edit_request")
 
@@ -3381,7 +3680,7 @@ async def edit_next_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def edit_finish_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик кнопки 'Завершить' при редактировании."""
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
     user_id = update.effective_user.id
 
     return await _finish_editing(update, context, user_id)
@@ -3390,7 +3689,7 @@ async def edit_finish_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def edit_prev_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик кнопки 'Назад' при редактировании."""
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
     user_id = update.effective_user.id
     req = context.user_data.get("edit_request")
 
@@ -3646,14 +3945,14 @@ async def _finish_editing(update, context, user_id):
 async def requests_back_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Возврат к списку заявок из карточки."""
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
     return await _show_requests_list(update, context, 0)
 
 
 async def requests_noop_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Noop для пагинации."""
     query = update.callback_query
-    await query.answer()
+    await _safe_answer(query)
     return REQUESTS_LIST
 
 
@@ -3685,15 +3984,43 @@ def main():
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
-    builder = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN)
+    # SOCKS5-прокси применяется и к обычным запросам, и к getUpdates.
+    proxy_url = None
     if SOCKS5_PROXY:
         proxy_url = SOCKS5_PROXY
         if not proxy_url.startswith("socks"):
             proxy_url = f"socks5://{proxy_url}"
-        http_request = HTTPXRequest(proxy_url=proxy_url)
-        builder = builder.request(http_request)
         masked = proxy_url.split("@")[-1] if "@" in proxy_url else proxy_url
         logger.info(f"Используется SOCKS5-прокси: {masked}")
+
+    def _make_request(read_timeout: float, pool_size: Optional[int]) -> HTTPXRequest:
+        """HTTPXRequest с настроенными тайм-аутами из config (env)."""
+        kwargs = {
+            "connect_timeout": HTTP_CONNECT_TIMEOUT,
+            "read_timeout": read_timeout,
+            "write_timeout": HTTP_WRITE_TIMEOUT,
+            "pool_timeout": HTTP_POOL_TIMEOUT,
+        }
+        if proxy_url:
+            kwargs["proxy"] = proxy_url
+        if pool_size:
+            kwargs["connection_pool_size"] = pool_size
+        return HTTPXRequest(**kwargs)
+
+    builder = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN)
+    # Отдельные HTTP-клиенты: обычный API и long polling (getUpdates).
+    builder = builder.request(_make_request(HTTP_READ_TIMEOUT, HTTP_API_POOL_SIZE))
+    builder = builder.get_updates_request(
+        _make_request(HTTP_GETUPDATES_READ_TIMEOUT, _GETUPDATES_POOL_SIZE)
+    )
+
+    async def _on_post_init(_application):
+        _log_op("application_start", detail=f"version={APP_VERSION}")
+
+    async def _on_post_shutdown(_application):
+        _log_op("application_stop", detail=f"version={APP_VERSION}")
+
+    builder = builder.post_init(_on_post_init).post_shutdown(_on_post_shutdown)
     app = builder.build()
 
     # Регистрация глобального обработчика ошибок
@@ -4002,15 +4329,8 @@ def main():
     )
 
     # Архивирование старых завершённых заявок (ежедневно в 03:00)
-    async def _archive_job(context):
-        from db import archive_completed_requests
-
-        count = archive_completed_requests()
-        if count:
-            logger.info(f"Автоматическое архивирование: {count} заявок")
-
     app.job_queue.run_daily(
-        _archive_job,
+        archive_old_requests_job,
         time=time(hour=3, minute=0, tzinfo=tz),
         name="archive_old_requests",
     )

@@ -77,6 +77,37 @@ def _validate_config():
     if MAX_FIELD_LENGTH < 1:
         errors.append(f"MAX_FIELD_LENGTH={MAX_FIELD_LENGTH} — должно быть >= 1")
 
+    # CONVERSATION_TIMEOUT_SEC: >= 30
+    if CONVERSATION_TIMEOUT_SEC < 30:
+        errors.append(
+            f"CONVERSATION_TIMEOUT_SEC={CONVERSATION_TIMEOUT_SEC} — должно быть >= 30"
+        )
+
+    # HTTP timeouts: >= 1 секунды
+    _http_timeouts = {
+        "HTTP_CONNECT_TIMEOUT": HTTP_CONNECT_TIMEOUT,
+        "HTTP_READ_TIMEOUT": HTTP_READ_TIMEOUT,
+        "HTTP_WRITE_TIMEOUT": HTTP_WRITE_TIMEOUT,
+        "HTTP_POOL_TIMEOUT": HTTP_POOL_TIMEOUT,
+        "HTTP_GETUPDATES_READ_TIMEOUT": HTTP_GETUPDATES_READ_TIMEOUT,
+    }
+    for _name, _value in _http_timeouts.items():
+        if _value < 1:
+            errors.append(f"{_name}={_value} — должно быть >= 1")
+
+    # HTTP_GETUPDATES_READ_TIMEOUT должен превышать long-poll timeout PTB (10 сек)
+    if HTTP_GETUPDATES_READ_TIMEOUT <= 10:
+        errors.append(
+            f"HTTP_GETUPDATES_READ_TIMEOUT={HTTP_GETUPDATES_READ_TIMEOUT} — "
+            "должно превышать long-poll timeout PTB (10 сек)"
+        )
+
+    # HTTP_API_POOL_SIZE: если задана — >= 32
+    if HTTP_API_POOL_SIZE is not None and HTTP_API_POOL_SIZE < 32:
+        errors.append(
+            f"HTTP_API_POOL_SIZE={HTTP_API_POOL_SIZE} — если задана, то >= 32"
+        )
+
     if errors:
         for e in errors:
             print(f"❌ Ошибка конфигурации: {e}", file=sys.stderr)
@@ -136,6 +167,25 @@ RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "5"))
 RATE_LIMIT_WINDOW_SEC = int(os.getenv("RATE_LIMIT_WINDOW_SEC", "60"))
 MAX_FIELD_LENGTH = int(os.getenv("MAX_FIELD_LENGTH", "500"))
 MAX_PHOTOS_PER_REQUEST = int(os.getenv("MAX_PHOTOS_PER_REQUEST", "5"))
+
+# ===== CONVERSATION TIMEOUT =====
+# Тайм-аут текстовых сценариев (сек). По истечении — очистка состояния,
+# уведомление пользователя и возврат в главное меню.
+CONVERSATION_TIMEOUT_SEC = int(os.getenv("CONVERSATION_TIMEOUT_SEC", "600"))
+
+# ===== HTTP / NETWORK =====
+# Тайм-ауты HTTPXRequest: обычные запросы к Telegram API.
+HTTP_CONNECT_TIMEOUT = float(os.getenv("HTTP_CONNECT_TIMEOUT", "10"))
+HTTP_READ_TIMEOUT = float(os.getenv("HTTP_READ_TIMEOUT", "30"))
+HTTP_WRITE_TIMEOUT = float(os.getenv("HTTP_WRITE_TIMEOUT", "30"))
+HTTP_POOL_TIMEOUT = float(os.getenv("HTTP_POOL_TIMEOUT", "5"))
+# Отдельный read-timeout для getUpdates (long polling); должен превышать
+# long-poll timeout PTB (10 сек по умолчанию).
+HTTP_GETUPDATES_READ_TIMEOUT = float(os.getenv("HTTP_GETUPDATES_READ_TIMEOUT", "60"))
+# Пул соединений обычного API: не задаём по умолчанию (дефолт PTB),
+# только если указана валидная переменная (>= 32).
+_http_api_pool_raw = os.getenv("HTTP_API_POOL_SIZE", "").strip()
+HTTP_API_POOL_SIZE = int(_http_api_pool_raw) if _http_api_pool_raw else None
 
 # ===== BACKUP =====
 

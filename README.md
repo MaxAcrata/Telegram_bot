@@ -219,6 +219,13 @@ Telegram_bot/
 | `SOCKS5_PROXY` | Нет | `""` | Адрес SOCKS5-прокси (например `socks5://127.0.0.1:1080`) |
 | `RATE_LIMIT_REQUESTS` | Нет | `5` | Максимум запросов в окно rate limiting |
 | `RATE_LIMIT_WINDOW_SEC` | Нет | `60` | Окно rate limiting (секунды) |
+| `CONVERSATION_TIMEOUT_SEC` | Нет | `600` | Тайм-аут текстовых сценариев (сек, минимум 30): очистка состояния, уведомление и возврат в меню |
+| `HTTP_CONNECT_TIMEOUT` | Нет | `10` | HTTP connect timeout до Telegram API (сек) |
+| `HTTP_READ_TIMEOUT` | Нет | `30` | HTTP read timeout обычных запросов (сек) |
+| `HTTP_WRITE_TIMEOUT` | Нет | `30` | HTTP write timeout (сек) |
+| `HTTP_POOL_TIMEOUT` | Нет | `5` | HTTP pool timeout (сек) |
+| `HTTP_GETUPDATES_READ_TIMEOUT` | Нет | `60` | Read timeout для getUpdates/long polling (должен превышать 10 сек PTB) |
+| `HTTP_API_POOL_SIZE` | Нет | дефолт PTB | Пул соединений обычного API; если задана — минимум 32 |
 | `MAX_FIELD_LENGTH` | Нет | `500` | Максимальная длина текстовых полей |
 | `MAX_PHOTOS_PER_REQUEST` | Нет | `5` | Максимум фото к одной заявке |
 | `BACKUP_DIR` | Нет | `/data/backups` (cloud) / `backups` (local) | Директория для резервных копий |
