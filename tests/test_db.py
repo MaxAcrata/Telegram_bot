@@ -234,6 +234,20 @@ def test_complete_request_idempotent():
     assert result["done_date"] == "2025-01-10"  # Оригинальная дата
 
 
+def test_complete_request_writes_audit():
+    """18: завершение записывается в audit_log (один раз, идемпотентно)"""
+    req_id = add_request("Тест", 1, "шт", date(2025, 1, 1), "И", "О")
+    complete_request(req_id, date(2025, 1, 10), user_id=7, user_name="Админ")
+    complete_request(req_id, date(2025, 2, 1), user_id=7, user_name="Админ")
+
+    entries = [
+        e for e in get_audit_log(request_id=req_id) if e["action"] == "completed"
+    ]
+    assert len(entries) == 1  # повторное завершение не дублирует audit
+    assert entries[0]["user_id"] == 7
+    assert entries[0]["details"] == "Дата: 2025-01-10"
+
+
 def test_update_request_status():
     """Статус заявки обновляется"""
     req_id = add_request("Тест", 1, "шт", date(2025, 1, 1), "И", "О")

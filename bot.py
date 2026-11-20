@@ -1069,10 +1069,13 @@ async def show_request_details(update: Update, context: ContextTypes.DEFAULT_TYP
                 )
             ]
         )
-    # Административное действие — только для админа и только активной заявки
+    # Административные действия — только для админа и только активной заявки
     if is_admin(user_id) and _is_active_request(req):
         keyboard_rows.append(
-            [InlineKeyboardButton("🚫 Отменить", callback_data=f"reqcx:{req_id}")]
+            [
+                InlineKeyboardButton("✅ Завершить", callback_data=f"crdone:{req_id}"),
+                InlineKeyboardButton("🚫 Отменить", callback_data=f"reqcx:{req_id}"),
+            ]
         )
     keyboard = InlineKeyboardMarkup(keyboard_rows) if keyboard_rows else None
 
@@ -2599,6 +2602,60 @@ async def complete_confirm_handler(update: Update, context: ContextTypes.DEFAULT
     return ConversationHandler.END
 
 
+async def complete_from_card_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    """crdone:{id} — запуск завершения из подробной карточки.
+
+    Переиспользует существующую логику: необязательный комментарий
+    (cr:nocomment / текст), подтверждение (cr:confirm), атомарный
+    complete_request, уведомления и audit.
+    """
+    query = update.callback_query
+    await _safe_answer(query)
+    if not is_admin(update.effective_user.id):
+        await _safe_edit(query, "⛔ Нет доступа.")
+        return None
+    req_id = int(query.data.split(":", 1)[1])
+    req = get_request_by_id(req_id)
+    if not req:
+        await _safe_edit(query, "⚠️ Заявка не найдена.")
+        return None
+    if req.get("done_date") or req.get("status") in (
+        "done",
+        "archived",
+        "cancelled",
+    ):
+        # Защита от двойного завершения / завершения недоступных заявок.
+        status_label = STATUS_LABELS.get(req.get("status"), req.get("status"))
+        await _safe_edit(
+            query,
+            f"ℹ️ Заявку нельзя завершить — статус: {status_label}.",
+        )
+        return None
+    # Переключение сценария ДО записи ключей (abort чужого сценария).
+    _set_flow_step(context, "complete", COMPLETE_COMMENT, update=update)
+    context.user_data["complete_request"] = req
+    context.user_data["complete_comment"] = ""
+    qty_text = f"{req.get('quantity', '—')} {req.get('unit', '')}".strip()
+    text = (
+        f"📋 <b>Заявка #{req['id']}</b>\n\n"
+        f"📦 {escape(req.get('name', '—'))}\n"
+        f"🔢 {escape(qty_text)}\n"
+        f"👤 {escape(req.get('initiator', '—'))}\n"
+        f"🏗️ {escape(req.get('object', '—'))}\n\n"
+        "Добавьте комментарий или пропустите:"
+    )
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("➡️ Без комментария", callback_data="cr:nocomment")],
+            [InlineKeyboardButton("❌ Отмена", callback_data="cr:cancel")],
+        ]
+    )
+    await _safe_edit(query, text, reply_markup=keyboard, parse_mode="HTML")
+    return COMPLETE_COMMENT
+
+
 # ===== ОТМЕНА ЗАЯВКИ (админ, из карточки) =====
 _ACTIVE_STATUSES = ("new", "ordered", "delivered")
 
@@ -4038,12 +4095,16 @@ async def _render_request_card(query, context, req: dict):
             ),
         ]
     )
-    action_row = []
+    admin_rows = []
     card_user = getattr(getattr(query, "from_user", None), "id", None)
     if is_admin(card_user) and _is_active_request(req):
-        action_row.append(
+        admin_rows.append(
+            InlineKeyboardButton("✅ Завершить", callback_data=f"crdone:{req_id}")
+        )
+        admin_rows.append(
             InlineKeyboardButton("🚫 Отменить", callback_data=f"reqcx:{req_id}")
         )
+    action_row = admin_rows or []
     action_row.append(
         InlineKeyboardButton("🗑 Удалить", callback_data=f"reqdel:{req_id}")
     )
@@ -4679,6 +4740,11 @@ def register_handlers(app):
         CallbackQueryHandler(
             _flow_result(complete_confirm_handler),
             pattern=r"^cr:(confirm|cancel)$",
+        )
+    )
+    app.add_handler(
+        CallbackQueryHandler(
+            _flow_result(complete_from_card_handler), pattern=r"^crdone:\d+$"
         )
     )
 

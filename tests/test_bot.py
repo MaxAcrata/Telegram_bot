@@ -488,7 +488,9 @@ async def test_admin_card_shows_cancel_button_for_active(mock_get, mock_photos):
 
     await show_request_details(update, context)
 
-    assert "reqcx:5" in _markup_datas(context.bot.send_message)
+    datas = _markup_datas(context.bot.send_message)
+    assert "reqcx:5" in datas
+    assert "crdone:5" in datas  # B2: завершение из карточки
 
 
 @pytest.mark.asyncio
@@ -506,7 +508,9 @@ async def test_user_card_hides_cancel_button(mock_get, mock_photos, mock_owner):
 
     await show_request_details(update, context)
 
-    assert "reqcx:5" not in _markup_datas(context.bot.send_message)
+    datas = _markup_datas(context.bot.send_message)
+    assert "reqcx:5" not in datas
+    assert "crdone:5" not in datas
 
 
 @pytest.mark.asyncio
@@ -523,7 +527,9 @@ async def test_done_request_card_hides_cancel_button(mock_get, mock_photos):
 
     await show_request_details(update, context)
 
-    assert "reqcx:5" not in _markup_datas(context.bot.send_message)
+    datas = _markup_datas(context.bot.send_message)
+    assert "reqcx:5" not in datas
+    assert "crdone:5" not in datas
 
 
 @pytest.mark.asyncio
@@ -610,3 +616,88 @@ async def test_cancel_repeat_is_idempotent_in_ui(mock_get, mock_cancel, mock_tg)
         for call in confirm.callback_query.edit_message_text.call_args_list
     ]
     assert any("уже была отменена" in e for e in edits)
+
+
+# ===== B2: завершение заявки из подробной карточки =====
+
+
+@pytest.mark.asyncio
+@patch("bot.get_initiator_tg_id", return_value=555)
+@patch("bot.complete_request")
+@patch("bot.get_request_by_id")
+@patch("bot.ADMIN_IDS", [123])
+async def test_complete_from_card_flow(mock_get, mock_complete, mock_tg):
+    """15/18: карточка -> crdone -> без комментария -> подтверждение.
+
+    Сохраняются уведомления (общий чат + инициатор) и вызов
+    атомарного complete_request.
+    """
+    from bot import (
+        COMPLETE_COMMENT,
+        COMPLETE_CONFIRM,
+        complete_comment_handler,
+        complete_confirm_handler,
+        complete_from_card_handler,
+    )
+    from config import TELEGRAM_CHAT_ID
+
+    mock_get.return_value = _active_row()
+    mock_complete.return_value = _active_row(status="done", done_date="2026-01-10")
+
+    context = make_context()
+
+    # 1) Кнопка «✅ Завершить» в карточке
+    result = await complete_from_card_handler(make_callback_update("crdone:5"), context)
+    assert result == COMPLETE_COMMENT
+    assert context.user_data["_flow"] == "complete"
+    assert context.user_data["_step"] == COMPLETE_COMMENT
+    assert context.user_data["complete_request"]["id"] == 5
+
+    # 2) «Без комментария»
+    update_nc = make_callback_update("cr:nocomment")
+    result = await complete_comment_handler(update_nc, context)
+    assert result == COMPLETE_CONFIRM
+    assert context.user_data["_step"] == COMPLETE_CONFIRM
+
+    # 3) Подтверждение
+    update_confirm = make_callback_update("cr:confirm")
+    await complete_confirm_handler(update_confirm, context)
+
+    # Атомарное завершение вызвано с нужным ID
+    assert mock_complete.call_args.args[0] == 5
+    # Уведомление в общий чат
+    assert any(
+        call.kwargs.get("chat_id") == int(TELEGRAM_CHAT_ID)
+        for call in context.bot.send_message.call_args_list
+    )
+    # Уведомление инициатору (tg_id=555)
+    assert any(
+        call.kwargs.get("chat_id") == 555
+        for call in context.bot.send_message.call_args_list
+    )
+    # Состояние завершено
+    assert "_flow" not in context.user_data
+    assert "complete_request" not in context.user_data
+
+
+@pytest.mark.asyncio
+@patch("bot.get_request_by_id")
+@patch("bot.ADMIN_IDS", [123])
+async def test_complete_from_card_rejects_done_request(mock_get):
+    """17/15: повторное завершение из устаревшей кнопки не выполняется."""
+    from bot import complete_from_card_handler
+
+    mock_get.return_value = _active_row(status="done", done_date="2026-01-10")
+    context = make_context()
+    update = make_callback_update("crdone:5")
+
+    result = await complete_from_card_handler(update, context)
+
+    assert result is None
+    assert "_flow" not in context.user_data
+    assert "complete_request" not in context.user_data
+    edits = [
+        str(call.args[0])
+        for call in update.callback_query.edit_message_text.call_args_list
+    ]
+    assert any("нельзя завершить" in e or "Выполнена" in e for e in edits)
